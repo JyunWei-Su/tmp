@@ -6,8 +6,16 @@ Usage:
     ic_cleanup.py <scan_root> [options]
 
 Options:
-    --log-trace FILE     Write scan results to FILE  (.gz extension = gzip compressed)
-    --log-delete FILE    Write delete actions to FILE (.gz extension = gzip compressed)
+    --out-dir DIR        Write all logs under DIR:
+                           DIR/trace.log   -- scan results
+                           DIR/delete.log  -- delete actions
+                           DIR/error.log   -- filesystem errors (bad inodes etc.)
+                         Append .gz to use gzip compression, e.g. --out-dir /tmp/out_gz
+                         (files will be trace.log.gz / delete.log.gz / error.log.gz)
+    --log-trace FILE     Write scan results to FILE  (overrides --out-dir trace log)
+    --log-delete FILE    Write delete actions to FILE (overrides --out-dir delete log)
+    --log-error FILE     Write filesystem errors to FILE (overrides --out-dir error log)
+    --gz                 When using --out-dir, compress all three logs with gzip
     --delete             Actually delete files (default: dry-run, list only)
     --level LEVEL [...]  Show only specific risk level(s):
                            safe | caution | danger | protected | not_current
@@ -40,6 +48,7 @@ not_current logic:
 
 import argparse
 import gzip
+import io
 import os
 import pwd
 import re
@@ -78,35 +87,27 @@ def _c(text, *codes):
 # ===========================================================================
 #  Risk level constants
 # ===========================================================================
-SAFE        = "Safe"        # ok to delete
-CAUTION     = "Caution"     # delete old, keep newest
-DANGER      = "Danger"      # manual confirm before deleting
-PROTECTED   = "Protected"   # never delete
-NOT_CURRENT = "Not-Current" # versioned dir: keep if pointed to by 'current' symlink
+SAFE        = "Safe"
+CAUTION     = "Caution"
+DANGER      = "Danger"
+PROTECTED   = "Protected"
+NOT_CURRENT = "Not-Current"
 
 ALL_LEVELS = (SAFE, CAUTION, DANGER, PROTECTED, NOT_CURRENT)
 
-# Internal sentinels for the two NOT_CURRENT outcomes
-_NCUR_SAFE = "__NCUR_SAFE__"  # matched NOT_CURRENT rule, NOT protected -> deletable
-_NCUR_KEEP = "__NCUR_KEEP__"  # matched NOT_CURRENT rule, IS  protected -> keep
-
-# ---------------------------------------------------------------------------
-#  Tag strings -- ALL padded to the SAME fixed width so columns line up.
-#  Width = len("[SAFE(NCUR)]") = 12
-# ---------------------------------------------------------------------------
-_TW = 12   # tag width (characters, excluding surrounding spaces in the column)
+_NCUR_SAFE = "__NCUR_SAFE__"
+_NCUR_KEEP = "__NCUR_KEEP__"
 
 _PLAIN = {
-    SAFE:        "[SAFE    ]  ",   # 12 chars
+    SAFE:        "[SAFE    ]  ",
     CAUTION:     "[CAUTION ]  ",
     DANGER:      "[DANGER  ]  ",
     PROTECTED:   "[PROTECT ]  ",
-    NOT_CURRENT: "[KEEP(CURR)]",   # NOT_CURRENT shown as keep  (12 chars)
+    NOT_CURRENT: "[KEEP(CURR)]",
     _NCUR_SAFE:  "[SAFE(NCUR)]",
     _NCUR_KEEP:  "[KEEP(CURR)]",
 }
 
-# Verify all plain tags are the same width at import time
 _tag_lengths = {k: len(v) for k, v in _PLAIN.items()}
 assert len(set(_tag_lengths.values())) == 1, \
     "Tag width mismatch: {}".format(_tag_lengths)
@@ -121,7 +122,6 @@ _COLOR = {
     _NCUR_KEEP:  _c(_PLAIN[_NCUR_KEEP],  "blue",   "bold"),
 }
 
-# Levels eligible for deletion
 _DELETABLE = (SAFE, CAUTION)
 
 LEVEL_MAP = {
@@ -153,18 +153,7 @@ def _tag_color(internal):
 
 
 # ===========================================================================
-#  Rule table -- THE ONLY PLACE TO EDIT RULES
-#
-#  Keys:
-#    pattern  (str, required) : Python regex matched against entry basename
-#    type     (str, required) : "f" | "d" | "fd"
-#    level    (str, required) : SAFE / CAUTION / DANGER / PROTECTED / NOT_CURRENT
-#    ancestor (str, optional) : Python regex matched against ANY component
-#                               of the absolute path from / to entry's parent.
-#    desc     (str, optional) : label shown in report
-#
-#  Rules evaluated top-to-bottom; first match wins.
-#  Matched directories are always pruned (never descended into).
+#  Rule table
 # ===========================================================================
 RULES = [  # type: List[Dict]
 
@@ -221,7 +210,7 @@ RULES = [  # type: List[Dict]
     {"pattern": r"^idbs$",                  "type": "d",  "level": SAFE,      "desc": "nvtClkExp temp"},
     {"pattern": r"^vsi\.tar\.lz4$",         "type": "f",  "level": SAFE,      "desc": "nvtCHK temp"},
 
-    # --- Caution: keep newest, delete old ---
+    # --- Caution ---
     {"pattern": r".*\.ddc$",                "type": "f",  "level": CAUTION,   "desc": "synthesis snapshot"},
     {"pattern": r".*\.saif$",               "type": "f",  "level": CAUTION,   "desc": "power activity file"},
     {"pattern": r".*\.bit$",                "type": "f",  "level": CAUTION,   "desc": "FPGA bitstream"},
@@ -232,7 +221,7 @@ RULES = [  # type: List[Dict]
     {"pattern": r".*\.spef$",               "type": "f",  "level": CAUTION,   "desc": "P&R parasitics"},
     {"pattern": r"^lint_cpdb$",             "type": "d",  "level": CAUTION,   "desc": "VCSG_lint cpdb"},
 
-    # --- Danger: manual confirm before deleting ---
+    # --- Danger ---
     {"pattern": r".*\.v$",                  "type": "f",  "level": DANGER,    "desc": "netlist/RTL (manual confirm)"},
     {"pattern": r".*\.vg$",                 "type": "f",  "level": DANGER,    "desc": "gate-level netlist"},
     {"pattern": r"^report_qor\.rpt$",       "type": "f",  "level": DANGER,    "desc": "STA signoff report"},
@@ -240,11 +229,7 @@ RULES = [  # type: List[Dict]
     {"pattern": r".*_final\.gds$",          "type": "f",  "level": DANGER,    "desc": "P&R final GDS"},
     {"pattern": r"^ptpx_final",             "type": "fd", "level": DANGER,    "desc": "power signoff"},
 
-    # --- Not-Current: versioned snapshot dirs under any MACRO ancestor ---
-    #
-    # Pattern matches 6-digit prefix names (e.g. 000111, 000112_patch).
-    # The sibling whose name is the resolved target of any "current*" symlink
-    # (case-insensitive) is shown as [KEEP(CURR)]; all others as [SAFE(NCUR)].
+    # --- Not-Current ---
     {
         "pattern":  r"^\d{6}.*$",
         "type":     "d",
@@ -253,7 +238,7 @@ RULES = [  # type: List[Dict]
         "desc":     "MACRO versioned snapshot",
     },
 
-    # --- Protected: never delete ---
+    # --- Protected ---
     {"pattern": r".*\.sv$",                 "type": "f",  "level": PROTECTED, "desc": "RTL source"},
     {"pattern": r".*\.sdc$",                "type": "f",  "level": PROTECTED, "desc": "timing constraints"},
     {"pattern": r"^Makefile$",              "type": "f",  "level": PROTECTED, "desc": "project config"},
@@ -264,7 +249,6 @@ RULES = [  # type: List[Dict]
     {"pattern": r".*\.pl$",                 "type": "f",  "level": PROTECTED, "desc": "flow script"},
 ]  # type: List[Dict]
 
-# Pre-compile all regexes once at import time
 for _r in RULES:
     _r["_pat_re"]      = re.compile(_r["pattern"])
     _r["_ancestor_re"] = re.compile(_r["ancestor"]) if _r.get("ancestor") else None
@@ -282,7 +266,7 @@ def has_ancestor_match(entry_abs, ancestor_re):
 
 
 # ===========================================================================
-#  "current" symlink resolution  (case-insensitive, cached per directory)
+#  "current" symlink resolution
 # ===========================================================================
 _current_cache = {}  # type: Dict[str, Set[str]]
 
@@ -304,7 +288,7 @@ def current_targets_in_dir(parent):
                     targets.add(resolved.name)
             except OSError:
                 pass
-    except PermissionError:
+    except (PermissionError, OSError):
         pass
     return targets
 
@@ -318,7 +302,7 @@ def get_current_targets(parent):
 
 
 # ===========================================================================
-#  Classification  ->  (internal_sentinel, description) or None
+#  Classification
 # ===========================================================================
 def classify(name, parent, is_dir):
     # type: (str, Path, bool) -> Optional[Tuple[str, str]]
@@ -333,22 +317,19 @@ def classify(name, parent, is_dir):
         if rule["_ancestor_re"] is not None:
             if not has_ancestor_match(entry_abs, rule["_ancestor_re"]):
                 continue
-
         level = rule["level"]
         desc  = rule.get("desc", "")
-
         if level == NOT_CURRENT:
             if name in get_current_targets(parent):
                 return _NCUR_KEEP, desc
             return _NCUR_SAFE, desc
-
         return level, desc
 
     return None
 
 
 # ===========================================================================
-#  File owner
+#  File owner  -- graceful on broken inodes
 # ===========================================================================
 def get_owner(path):
     # type: (Path) -> str
@@ -384,17 +365,11 @@ def fmt_mtime(ts):
 
 def dir_total_size(path):
     # type: (Path) -> int
-    """Recursively calculate directory size.
-
-    Uses a manual stack-based scandir loop instead of os.walk so that
-    _interrupted is checked at every Python-level iteration.  This means
-    Ctrl-C is honoured within one entry's worth of latency rather than
-    waiting for the entire C-level readdir() batch to finish.
-
-    Returns -1 if interrupted before completion.
-    """
-    total   = 0
-    stack   = [str(path)]
+    """Full recursive size via stack-based scandir.
+    Checks _interrupted at every Python iteration so Ctrl-C is responsive.
+    Returns -1 if interrupted before completion."""
+    total  = 0
+    stack  = [str(path)]
     while stack:
         if _interrupted:
             return -1
@@ -417,12 +392,7 @@ def dir_total_size(path):
     return total
 
 
-# ---------------------------------------------------------------------------
-#  Column layout
-#  All plain tags are the same width (enforced by the assert above).
-#  We use that width for the LEVEL column header too.
-# ---------------------------------------------------------------------------
-_TAG_COL_W   = len(list(_PLAIN.values())[0])   # e.g. 12
+_TAG_COL_W   = len(list(_PLAIN.values())[0])
 _OWNER_WIDTH = 12
 
 HEADER_PLAIN = "{:>12}  {:<16}  {:<{tw}}  {:<{ow}}  {:<4}  {}".format(
@@ -434,7 +404,7 @@ SEP = "-" * 120
 
 def fmt_row(size, mtime, internal, owner, ftype, abs_path, for_file=False):
     # type: (int, float, str, str, str, str, bool) -> str
-    tag = _tag_plain(internal) if for_file else _tag_color(internal)
+    tag       = _tag_plain(internal) if for_file else _tag_color(internal)
     ftype_str = "DIR " if ftype == "D" else "FILE"
     return "{:>12}  {:<16}  {}  {:<{ow}}  {:<4}  {}".format(
         human_size(size),
@@ -448,7 +418,7 @@ def fmt_row(size, mtime, internal, owner, ftype, abs_path, for_file=False):
 
 
 # ===========================================================================
-#  Progress line on stderr  (transient, reprinted after each result row)
+#  Progress line on stderr
 # ===========================================================================
 _TERM_WIDTH = shutil.get_terminal_size((120, 24)).columns
 
@@ -475,21 +445,12 @@ def _clear_progress():
 
 # ===========================================================================
 #  Log file helpers
-#  Supports plain text and gzip (.gz suffix) with line-by-line flushing
-#  so the file is always up-to-date even if the process is interrupted.
 # ===========================================================================
 def open_log(path):
     # type: (str) -> object
-    """Open a log file for line-by-line text writing.
-
-    If the path ends with .gz the file is gzip-compressed.
-    We construct the GzipFile manually (mtime=0) so the output is
-    deterministic and compatible with vim's gzip.vim plugin and standard
-    gunzip / zcat tools.  The TextIOWrapper on top provides a .write(str)
-    interface with UTF-8 encoding.
-    """
+    """Open a log file for line-by-line UTF-8 text writing.
+    .gz suffix -> gzip with mtime=0 (vim-compatible single-stream gzip)."""
     if path.endswith(".gz"):
-        import io
         raw = open(path, "wb")
         gz  = gzip.GzipFile(filename="", mode="wb", compresslevel=6,
                              fileobj=raw, mtime=0)
@@ -499,15 +460,14 @@ def open_log(path):
 
 def _write_fh(fh, line):
     # type: (object, str) -> None
-    """Write a line and flush immediately so on-disk content stays current."""
+    """Write one line and flush immediately (keeps on-disk content current)."""
     if fh is not None:
-        fh.write(line + "\n")          # type: ignore[union-attr]
-        fh.flush()                     # type: ignore[union-attr]
+        fh.write(line + "\n")   # type: ignore[union-attr]
+        fh.flush()              # type: ignore[union-attr]
 
 
 def emit_row(line_term, line_plain, scan_fh, cur_dir):
     # type: (str, str, object, str) -> None
-    """Print result row to stdout + scan log, then reprint progress."""
     _clear_progress()
     print(line_term)
     _write_fh(scan_fh, line_plain)
@@ -537,13 +497,25 @@ def _install_sigint_handler():
 
 
 # ===========================================================================
+#  Error logging helper
+# ===========================================================================
+def _log_error(error_fh, path, exc):
+    # type: (object, str, Exception) -> None
+    """Record a filesystem error to error log and stderr (dim)."""
+    msg = "ERROR  {}  {}".format(path, exc)
+    _clear_progress()
+    sys.stderr.write(_c("  " + msg + "\n", "dim"))
+    sys.stderr.flush()
+    _write_fh(error_fh, msg)
+
+
+# ===========================================================================
 #  Streaming scan
 # ===========================================================================
-def scan_and_print(root, level_filter, scan_fh, trace_path):
-    # type: (Path, Optional[Set[str]], object, str) -> List[Tuple]
+def scan_and_print(root, level_filter, scan_fh, error_fh, trace_path, error_path):
+    # type: (Path, Optional[Set[str]], object, object, str, str) -> List[Tuple]
     """
     Result tuples: (size, mtime, effective_level, internal, owner, ftype, abs_path)
-    trace_path: display path for the log status line (empty string = no log)
     """
     root_real = Path(os.path.realpath(str(root)))
 
@@ -553,18 +525,17 @@ def scan_and_print(root, level_filter, scan_fh, trace_path):
     _write_fh(scan_fh, HEADER_PLAIN)
     _write_fh(scan_fh, SEP)
 
-    # Always show log path status (even when no log file is used)
-    if trace_path:
-        print(_c("  log-trace : {}".format(trace_path), "dim"))
-    else:
-        print(_c("  log-trace : (none)", "dim"))
+    # Always show log path status below header
+    print(_c("  log-trace : {}".format(trace_path if trace_path else "(none)"), "dim"))
+    print(_c("  log-error : {}".format(error_path if error_path else "(none)"), "dim"))
     print()
 
     results = []   # type: List[Tuple]
     counts  = {lv: 0 for lv in ALL_LEVELS}  # type: Dict[str, int]
     cur_dir = ""
 
-    for dirpath, dirnames, filenames in os.walk(str(root), followlinks=False):
+    for dirpath, dirnames, filenames in os.walk(str(root), followlinks=False,
+                                                onerror=lambda e: None):
         if _interrupted:
             dirnames[:] = []
             break
@@ -579,7 +550,15 @@ def scan_and_print(root, level_filter, scan_fh, trace_path):
                 break
 
             full = dp / dname
-            if full.is_symlink():
+
+            # safe is_symlink -- broken inodes return False, never raise
+            try:
+                is_sym = full.is_symlink()
+            except OSError as exc:
+                _log_error(error_fh, str(full), exc)
+                dirnames.remove(dname)
+                continue
+            if is_sym:
                 continue
 
             result = classify(dname, dp, is_dir=True)
@@ -589,24 +568,32 @@ def scan_and_print(root, level_filter, scan_fh, trace_path):
             internal, _desc = result
             effective = _effective_level(internal)
 
-            # Always prune -- never descend into matched dirs
             dirnames.remove(dname)
 
             if level_filter and effective not in level_filter:
                 continue
 
-            if _interrupted:          # don't start expensive size calc after Ctrl-C
+            if _interrupted:
+                break
+
+            # stat the entry -- catch all OSError variants (EIO, ESTALE, etc.)
+            try:
+                st = full.stat()
+            except OSError as exc:
+                _log_error(error_fh, str(full), exc)
+                continue
+
+            size = dir_total_size(full)
+            if size == -1:
                 break
 
             try:
-                st    = full.stat()
-                size  = dir_total_size(full)
-                if size == -1:        # aborted mid-way by Ctrl-C
-                    break
                 mt    = st.st_mtime
                 owner = get_owner(full)
-            except PermissionError:
-                continue
+            except OSError as exc:
+                _log_error(error_fh, str(full), exc)
+                mt    = 0.0
+                owner = "?"
 
             abs_path = str(root_real / full.relative_to(root))
             emit_row(
@@ -623,7 +610,13 @@ def scan_and_print(root, level_filter, scan_fh, trace_path):
                 break
 
             full = dp / fname
-            if full.is_symlink():
+
+            try:
+                is_sym = full.is_symlink()
+            except OSError as exc:
+                _log_error(error_fh, str(full), exc)
+                continue
+            if is_sym:
                 continue
 
             result = classify(fname, dp, is_dir=False)
@@ -641,7 +634,8 @@ def scan_and_print(root, level_filter, scan_fh, trace_path):
                 size  = st.st_size
                 mt    = st.st_mtime
                 owner = get_owner(full)
-            except PermissionError:
+            except OSError as exc:
+                _log_error(error_fh, str(full), exc)
                 continue
 
             abs_path = str(root_real / full.relative_to(root))
@@ -655,7 +649,6 @@ def scan_and_print(root, level_filter, scan_fh, trace_path):
 
     _clear_progress()
 
-    # --- summary ---
     total_size  = sum(r[0] for r in results)
     total_count = len(results)
     partial     = "  [PARTIAL - scan interrupted]" if _interrupted else ""
@@ -682,13 +675,8 @@ def scan_and_print(root, level_filter, scan_fh, trace_path):
 # ===========================================================================
 #  Delete  (dry-run by default)
 # ===========================================================================
-def do_delete(results, dry_run, delete_fh, delete_path):
-    # type: (List[Tuple], bool, object, str) -> None
-    """
-    delete_fh   : open file handle for the delete log, or None.
-    delete_path : display path for the log status line (empty string = no log)
-    The delete log is written in plain text (no ANSI codes), flushed per line.
-    """
+def do_delete(results, dry_run, delete_fh, error_fh, delete_path):
+    # type: (List[Tuple], bool, object, object, str) -> None
     deletable = [r for r in results if r[2] in _DELETABLE]
 
     if not deletable:
@@ -697,36 +685,30 @@ def do_delete(results, dry_run, delete_fh, delete_path):
         _write_fh(delete_fh, msg)
         return
 
-    mode        = "DRY-RUN" if dry_run else "DELETE"
-    ts          = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    tag_term    = _c("[{}]".format(mode), "yellow" if dry_run else "red", "bold")
-    tag_plain   = "[{}]".format(mode)
+    mode      = "DRY-RUN" if dry_run else "DELETE"
+    ts        = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    tag_term  = _c("[{}]".format(mode), "yellow" if dry_run else "red", "bold")
+    tag_plain = "[{}]".format(mode)
 
-    header_msg  = "\n{} {} items eligible (Safe + Caution only):".format(
-        tag_plain, len(deletable))
     print("\n{}  {} items eligible (Safe + Caution only):".format(
         tag_term, len(deletable)))
-
-    # Always show delete log path status
-    if delete_path:
-        print(_c("  log-delete: {}".format(delete_path), "dim"))
-    else:
-        print(_c("  log-delete: (none)", "dim"))
+    print(_c("  log-delete: {}".format(delete_path if delete_path else "(none)"), "dim"))
     print()
 
     _write_fh(delete_fh, "# IC Cleanup -- delete log")
     _write_fh(delete_fh, "# Date : {}".format(ts))
     _write_fh(delete_fh, "# Mode : {}".format(mode))
-    _write_fh(delete_fh, header_msg)
+    _write_fh(delete_fh, "\n{} {} items eligible (Safe + Caution only):".format(
+        tag_plain, len(deletable)))
     _write_fh(delete_fh, SEP)
     _write_fh(delete_fh, HEADER_PLAIN)
     _write_fh(delete_fh, SEP)
 
     for _size, _mt, effective, internal, owner, ftype, path in deletable:
         if _interrupted:
-            interrupted_msg = "  [INTERRUPTED] delete aborted."
-            print(_c(interrupted_msg, "yellow"))
-            _write_fh(delete_fh, interrupted_msg)
+            msg = "  [INTERRUPTED] delete aborted."
+            print(_c(msg, "yellow"))
+            _write_fh(delete_fh, msg)
             break
 
         row_plain = fmt_row(_size, _mt, internal, owner, ftype, str(path), for_file=True)
@@ -741,11 +723,11 @@ def do_delete(results, dry_run, delete_fh, delete_path):
                     path.unlink()
             except Exception as exc:
                 status = "ERROR: {}".format(exc)
+                _log_error(error_fh, str(path), exc)  # type: ignore[arg-type]
 
-        print("  {}  {}".format(tag_term,  row_term))
+        print("  {}  {}".format(tag_term, row_term))
         if status != "OK":
-            err_msg = "             {}".format(status)
-            print(_c(err_msg, "red"))
+            print(_c("             {}".format(status), "red"))
             _write_fh(delete_fh, row_plain + "  -> " + status)
         else:
             _write_fh(delete_fh, row_plain)
@@ -769,18 +751,65 @@ def build_parser():
     )
     p.add_argument("root",
         help="Root directory to scan")
+
+    # output directory (convenient single flag)
+    p.add_argument("--out-dir", metavar="DIR", default=None,
+        dest="out_dir",
+        help="Write trace/delete/error logs under DIR "
+             "(use --gz to compress)")
+    p.add_argument("--gz", action="store_true", default=False,
+        help="Compress logs produced by --out-dir with gzip (.gz)")
+
+    # individual overrides
     p.add_argument("--log-trace", metavar="FILE", default=None,
         dest="log_trace",
-        help="Write scan results to FILE (use .gz suffix for gzip compression)")
+        help="Scan trace log (overrides --out-dir; .gz = gzip)")
     p.add_argument("--log-delete", metavar="FILE", default=None,
         dest="log_delete",
-        help="Write delete actions to FILE (use .gz suffix for gzip compression)")
+        help="Delete action log (overrides --out-dir; .gz = gzip)")
+    p.add_argument("--log-error", metavar="FILE", default=None,
+        dest="log_error",
+        help="Filesystem error log (overrides --out-dir; .gz = gzip)")
+
     p.add_argument("--delete", action="store_true", default=False,
         help="Actually delete Safe/Caution items (default: dry-run)")
     p.add_argument("--level", metavar="LEVEL", nargs="+", default=None,
         choices=list(LEVEL_MAP.keys()),
-        help="Filter output (one or more): safe caution danger protected not_current")
+        help="Filter output: safe caution danger protected not_current")
     return p
+
+
+def _resolve_log_paths(args):
+    # type: (argparse.Namespace) -> Tuple[str, str, str]
+    """Return (trace_path, delete_path, error_path) as absolute strings.
+    Individual --log-* flags override --out-dir."""
+    ext = ".gz" if args.gz else ""
+
+    def _from_dir(name):
+        # type: (str) -> str
+        if args.out_dir:
+            return str(Path(args.out_dir).resolve() / (name + ".log" + ext))
+        return ""
+
+    trace_path  = (str(Path(args.log_trace).resolve())
+                   if args.log_trace else _from_dir("trace"))
+    delete_path = (str(Path(args.log_delete).resolve())
+                   if args.log_delete else _from_dir("delete"))
+    error_path  = (str(Path(args.log_error).resolve())
+                   if args.log_error else _from_dir("error"))
+    return trace_path, delete_path, error_path
+
+
+def _open_log_safe(path, label):
+    # type: (str, str) -> Optional[object]
+    """Open a log file; print error and return None on failure."""
+    if not path:
+        return None
+    try:
+        return open_log(path)
+    except OSError as exc:
+        print("ERROR: cannot open {}: {}".format(label, exc), file=sys.stderr)
+        return None
 
 
 def main():
@@ -794,6 +823,14 @@ def main():
         print("ERROR: directory not found: {}".format(root), file=sys.stderr)
         sys.exit(1)
 
+    # Create --out-dir if needed
+    if args.out_dir:
+        try:
+            Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print("ERROR: cannot create out-dir: {}".format(exc), file=sys.stderr)
+            sys.exit(1)
+
     level_filter = None  # type: Optional[Set[str]]
     if args.level:
         level_filter = {LEVEL_MAP[l] for l in args.level}
@@ -801,43 +838,38 @@ def main():
     root_real = Path(os.path.realpath(str(root)))
     print("Scanning: {}\n".format(_c(str(root_real), "bold")))
 
-    # --- open scan (trace) log ---
-    scan_fh    = None
-    trace_path = ""
-    if args.log_trace:
-        trace_path = str(Path(args.log_trace).resolve())
-        try:
-            scan_fh = open_log(args.log_trace)
-            scan_fh.write("# IC Cleanup -- scan trace log\n")  # type: ignore
-            scan_fh.write("# Root  : {}\n".format(root_real))  # type: ignore
-            scan_fh.write("# Date  : {}\n".format(            # type: ignore
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-            scan_fh.write("# Filter: {}\n\n".format(          # type: ignore
-                ", ".join(args.level) if args.level else "all"))
-            scan_fh.flush()                                    # type: ignore
-        except OSError as exc:
-            print("ERROR: cannot open log-trace: {}".format(exc), file=sys.stderr)
-            sys.exit(1)
+    trace_path, delete_path, error_path = _resolve_log_paths(args)
 
-    # --- open delete log ---
-    delete_fh    = None
-    delete_path  = ""
-    if args.log_delete:
-        delete_path = str(Path(args.log_delete).resolve())
-        try:
-            delete_fh = open_log(args.log_delete)
-        except OSError as exc:
-            print("ERROR: cannot open log-delete: {}".format(exc), file=sys.stderr)
-            if scan_fh:
-                scan_fh.close()  # type: ignore
-            sys.exit(1)
+    # Open all three logs (None if not configured)
+    scan_fh  = _open_log_safe(trace_path,  "--log-trace")
+    error_fh = _open_log_safe(error_path,  "--log-error")
+    delete_fh = _open_log_safe(delete_path, "--log-delete")
+
+    if scan_fh:
+        _write_fh(scan_fh, "# IC Cleanup -- scan trace log")
+        _write_fh(scan_fh, "# Root  : {}".format(root_real))
+        _write_fh(scan_fh, "# Date  : {}".format(
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        _write_fh(scan_fh, "# Filter: {}\n".format(
+            ", ".join(args.level) if args.level else "all"))
+
+    if error_fh:
+        _write_fh(error_fh, "# IC Cleanup -- filesystem error log")
+        _write_fh(error_fh, "# Root  : {}".format(root_real))
+        _write_fh(error_fh, "# Date  : {}\n".format(
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
 
     try:
-        results = scan_and_print(root, level_filter, scan_fh, trace_path)
+        results = scan_and_print(root, level_filter,
+                                 scan_fh, error_fh,
+                                 trace_path, error_path)
     finally:
         if scan_fh:
-            scan_fh.close()  # type: ignore
-            print("\nScan trace log written to: {}".format(_c(trace_path, "cyan")))
+            scan_fh.close()   # type: ignore
+            print("\nScan trace log  : {}".format(_c(trace_path, "cyan")))
+        if error_fh:
+            error_fh.close()  # type: ignore
+            print("Filesystem errors: {}".format(_c(error_path, "cyan")))
 
     if not results:
         print("\nNo matching files found.")
@@ -848,11 +880,12 @@ def main():
     print()
     try:
         do_delete(results, dry_run=not args.delete,
-                  delete_fh=delete_fh, delete_path=delete_path)
+                  delete_fh=delete_fh, error_fh=error_fh,
+                  delete_path=delete_path)
     finally:
         if delete_fh:
             delete_fh.close()  # type: ignore
-            print("\nDelete log written to: {}".format(_c(delete_path, "cyan")))
+            print("\nDelete log      : {}".format(_c(delete_path, "cyan")))
 
     if _interrupted:
         sys.exit(130)
