@@ -1,0 +1,87 @@
+{
+  "_comment": [
+    "IC Cleanup rule file.",
+    "Fields per rule:",
+    "  pattern  (required) : Python regex matched against entry basename",
+    "  type     (required) : 'f'=file only  'd'=dir only  'fd'=both",
+    "  level    (required) : safe | caution | danger | protected | not_current",
+    "  ancestor (optional) : Python regex matched against ANY ancestor dir name",
+    "  desc     (optional) : human-readable label",
+    "",
+    "Rules are evaluated top-to-bottom; first match wins.",
+    "Rule IDs are auto-assigned at load time (R001, R002, ...).",
+    "not_current: sibling pointed to by a 'current*' symlink => KEEP(CURR),",
+    "             all other matching siblings => SAFE(NCUR)."
+  ],
+  "rules": [
+    {"pattern": ".*\\.fsdb$",               "type": "f",  "level": "safe",        "desc": "sim waveform"},
+    {"pattern": ".*\\.vcd$",                "type": "f",  "level": "safe",        "desc": "sim waveform"},
+    {"pattern": ".*\\.shm$",                "type": "f",  "level": "safe",        "desc": "sim waveform"},
+    {"pattern": ".*\\.vpd$",                "type": "f",  "level": "safe",        "desc": "sim waveform"},
+
+    {"pattern": ".*INCA_libs$",             "type": "d",  "level": "safe",        "desc": "compile cache dir"},
+    {"pattern": ".*xcelium\\.d$",           "type": "d",  "level": "safe",        "desc": "compile cache dir"},
+    {"pattern": "^csrc$",                   "type": "d",  "level": "safe",        "desc": "compile cache dir"},
+    {"pattern": "^simv$",                   "type": "f",  "level": "safe",        "desc": "sim binary"},
+    {"pattern": "^simv\\.daidir$",          "type": "d",  "level": "safe",        "desc": "sim binary dir"},
+
+    {"pattern": ".*\\.log$",                "type": "f",  "level": "safe",        "desc": "log file"},
+    {"pattern": ".*sim\\.log$",             "type": "f",  "level": "safe",        "desc": "sim log"},
+    {"pattern": ".*\\.swp$",                "type": "f",  "level": "safe",        "desc": "vim swap file"},
+    {"pattern": "^crte_.*\\.txt$",          "type": "f",  "level": "safe",        "desc": "crte temp file"},
+    {"pattern": "^work_restore$",           "type": "d",  "level": "safe",        "desc": "work restore dir"},
+
+    {"pattern": "^DMSA_output_",            "type": "d",  "level": "safe",        "desc": "STA workspace"},
+    {"pattern": "^PT_output_",              "type": "d",  "level": "safe",        "desc": "STA workspace"},
+    {"pattern": ".*PT_session$",            "type": "d",  "level": "safe",        "desc": "PT session dir"},
+    {"pattern": ".*PC_session$",            "type": "d",  "level": "safe",        "desc": "PC session dir"},
+    {"pattern": ".*TWK_session$",           "type": "d",  "level": "safe",        "desc": "TWK session dir"},
+    {"pattern": "^save_bf_session$",        "type": "d",  "level": "safe",        "desc": "STA patch record"},
+    {"pattern": "^save_af_session$",        "type": "d",  "level": "safe",        "desc": "STA patch record"},
+
+    {"pattern": ".*\\.power\\.list$",       "type": "f",  "level": "safe",        "desc": "PTPX temp"},
+    {"pattern": ".*\\.timing$",             "type": "f",  "level": "safe",        "desc": "PTPX temp"},
+    {"pattern": ".*checkpoint$",            "type": "fd", "level": "safe",        "desc": "LEC checkpoint"},
+    {"pattern": ".*FM_WORK$",               "type": "d",  "level": "safe",        "desc": "Formality work dir"},
+    {"pattern": ".*FM_INFO$",               "type": "d",  "level": "safe",        "desc": "Formality info dir"},
+    {"pattern": ".*\\.fss$",                "type": "f",  "level": "safe",        "desc": "Formality aux"},
+    {"pattern": ".*\\.svf$",                "type": "f",  "level": "safe",        "desc": "Formality aux"},
+    {"pattern": "^core\\.",                 "type": "f",  "level": "safe",        "desc": "system crash dump"},
+
+    {"pattern": "^violation_report\\.rpt$", "type": "f",  "level": "safe",        "desc": "sg_sdc violation report"},
+    {"pattern": "^vcst_",                   "type": "fd", "level": "safe",        "desc": "VCSG_lint temp"},
+    {"pattern": "^vcst_rtdb$",              "type": "d",  "level": "safe",        "desc": "VCSG_lint rtdb"},
+    {"pattern": "^vcst_rtdb\\.bak$",        "type": "d",  "level": "safe",        "desc": "VCSG_lint rtdb backup"},
+    {"pattern": "^idbs$",                   "type": "d",  "level": "safe",        "desc": "nvtClkExp temp"},
+    {"pattern": "^vsi\\.tar\\.lz4$",        "type": "f",  "level": "safe",        "desc": "nvtCHK temp"},
+
+    {"pattern": ".*\\.ddc$",                "type": "f",  "level": "caution",     "desc": "synthesis snapshot"},
+    {"pattern": ".*\\.saif$",               "type": "f",  "level": "caution",     "desc": "power activity file"},
+    {"pattern": ".*\\.bit$",                "type": "f",  "level": "caution",     "desc": "FPGA bitstream"},
+    {"pattern": ".*\\.bin$",                "type": "f",  "level": "caution",     "desc": "FPGA bitstream"},
+    {"pattern": ".*\\.mcs$",                "type": "f",  "level": "caution",     "desc": "FPGA bitstream"},
+    {"pattern": ".*\\.pat$",                "type": "f",  "level": "caution",     "desc": "DFT pattern"},
+    {"pattern": "^PC_output",               "type": "d",  "level": "caution",     "desc": "P&R intermediate layout"},
+    {"pattern": ".*\\.spef$",               "type": "f",  "level": "caution",     "desc": "P&R parasitics"},
+    {"pattern": "^lint_cpdb$",              "type": "d",  "level": "caution",     "desc": "VCSG_lint cpdb"},
+
+    {"pattern": ".*\\.v$",                  "type": "f",  "level": "danger",      "desc": "netlist/RTL (manual confirm)"},
+    {"pattern": ".*\\.vg$",                 "type": "f",  "level": "danger",      "desc": "gate-level netlist"},
+    {"pattern": "^report_qor\\.rpt$",       "type": "f",  "level": "danger",      "desc": "STA signoff report"},
+    {"pattern": "^summary_.*\\.rpt$",       "type": "f",  "level": "danger",      "desc": "STA signoff summary"},
+    {"pattern": ".*_final\\.gds$",          "type": "f",  "level": "danger",      "desc": "P&R final GDS"},
+    {"pattern": "^ptpx_final",              "type": "fd", "level": "danger",      "desc": "power signoff"},
+
+    {"pattern": "^\\d{6}.*$",              "type": "d",  "level": "not_current", "desc": "MACRO versioned snapshot",
+     "ancestor": ".*MACRO.*"},
+
+    {"pattern": ".*\\.sv$",                 "type": "f",  "level": "protected",   "desc": "RTL source"},
+    {"pattern": ".*\\.sdc$",                "type": "f",  "level": "protected",   "desc": "timing constraints"},
+    {"pattern": "^Makefile$",               "type": "f",  "level": "protected",   "desc": "project config"},
+    {"pattern": ".*\\.prj$",                "type": "f",  "level": "protected",   "desc": "project config"},
+    {"pattern": ".*\\.sgdc$",               "type": "f",  "level": "protected",   "desc": "project config"},
+    {"pattern": ".*\\.tcl$",                "type": "f",  "level": "protected",   "desc": "flow script"},
+    {"pattern": ".*\\.py$",                 "type": "f",  "level": "protected",   "desc": "flow script"},
+    {"pattern": ".*\\.pl$",                 "type": "f",  "level": "protected",   "desc": "flow script"}
+  ]
+}
