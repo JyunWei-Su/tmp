@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+“””
+IC Design 專案檔案清理分類與風險分級工具
+用法:
+python ic_cleanup.py <掃描目錄> [選項]
+
+選項:
+–output FILE   將結果寫入指定檔案（預設：不寫出）
+–delete        真正執行刪除（預設：dry-run，只列出不刪）
+–level LEVEL   只顯示指定風險等級（low / medium / high / dont_touch）
+–sort SIZE|TIME|LEVEL|PATH  排序方式（預設：LEVEL）
+“””
+
+import argparse
+import fnmatch
+import os
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+
+# ============================================================
+
+# 風險等級定義
+
+# ============================================================
+
+LOW       = “Low Risk”
+MEDIUM    = “Medium Risk”
+HIGH      = “High Risk”
+DONT      = “DON’T TOUCH”
+
+LEVEL_ORDER = {LOW: 0, MEDIUM: 1, HIGH: 2, DONT: 3}
+
+LEVEL_SYMBOL = {
+LOW:    “✅”,
+MEDIUM: “⚠️ “,
+HIGH:   “🔴”,
+DONT:   “🚫”,
+}
+
+# ============================================================
+
+# 規則表（維護重點）
+
+# 每條規則: (pattern, risk_level, description)
+
+# pattern 支援 fnmatch wildcard，對應 path 的最後一段（檔名或目錄名）
+
+# 若要比對完整相對路徑，可在 pattern 前加 **/
+
+# ============================================================
+
+RULES: list[tuple[str, str, str]] = [
+# ── Low Risk：波形檔 ────────────────────────────────────
+(”*.fsdb”,                  LOW,    “模擬波形檔”),
+(”*.vcd”,                   LOW,    “模擬波形檔”),
+(”*.shm”,                   LOW,    “模擬波形檔”),
+(”*.vpd”,                   LOW,    “模擬波形檔”),
+
+```
+# ── Low Risk：編譯暫存 ──────────────────────────────────
+("*INCA_libs",              LOW,    "編譯暫存目錄"),
+("*xcelium.d",              LOW,    "編譯暫存目錄"),
+("csrc",                    LOW,    "編譯暫存目錄"),
+("simv",                    LOW,    "執行暫存"),
+("simv.daidir",             LOW,    "執行暫存目錄"),
+
+# ── Low Risk：Log ────────────────────────────────────────
+("*.log",                   LOW,    "Log 檔"),
+("*sim.log",                LOW,    "模擬 Log"),
+
+# ── Low Risk：STA 工作區 ─────────────────────────────────
+("DMSA_output_*",           LOW,    "STA 工作區"),
+("PT_output_*",             LOW,    "STA 工作區"),
+("*PT_session",             LOW,    "PT Session"),
+("*PC_session",             LOW,    "PC Session"),
+("*TWK_session",            LOW,    "TWK Session"),
+("save_bf_session",         LOW,    "STA 修補記錄"),
+("save_af_session",         LOW,    "STA 修補記錄"),
+
+# ── Low Risk：其他工具 ───────────────────────────────────
+("*.power.list",            LOW,    "PTPX 分析暫存"),
+("*.timing",                LOW,    "PTPX 分析暫存"),
+("*checkpoint",             LOW,    "LEC Checkpoint"),
+("*FM_WORK",                LOW,    "Formality 運算區"),
+("*FM_INFO",                LOW,    "Formality 運算區"),
+("*.fss",                   LOW,    "Formality 輔助檔"),
+("*.svf",                   LOW,    "Formality 輔助檔"),
+("core.*",                  LOW,    "系統 Crash 檔"),
+
+# ── Low Risk：特例 ───────────────────────────────────────
+("violation_report.rpt",    LOW,    "sg_sdc 違規報告"),
+("vcst_*",                  LOW,    "VCSG_lint 暫存"),
+("vcst_rtdb",               LOW,    "VCSG_lint DB"),
+("vcst_rtdb.bak",           LOW,    "VCSG_lint DB 備份"),
+("idbs",                    LOW,    "nvtClkExp 暫存"),
+("vsi.tar.lz4",             LOW,    "nvtCHK 暫存"),
+
+# ── Medium Risk ──────────────────────────────────────────
+("*.ddc",                   MEDIUM, "合成設計快照"),
+("*.saif",                  MEDIUM, "Power 活動率"),
+("*.bit",                   MEDIUM, "FPGA 燒錄檔"),
+("*.bin",                   MEDIUM, "FPGA 燒錄檔"),
+("*.mcs",                   MEDIUM, "FPGA 燒錄檔"),
+("*.pat",                   MEDIUM, "DFT Pattern"),
+("PC_output*",              MEDIUM, "P&R 中間 Layout"),
+("*.spef",                  MEDIUM, "P&R 寄生參數"),
+("lint_cpdb",               MEDIUM, "VCSG_lint DB"),
+
+# ── High Risk ────────────────────────────────────────────
+("report_qor.rpt",          HIGH,   "STA Signoff 報表"),
+("summary_*.rpt",           HIGH,   "STA Signoff 摘要"),
+("*_final.gds",             HIGH,   "P&R Final GDS"),
+("ptpx_final*",             HIGH,   "Power Signoff"),
+
+# ── DON'T TOUCH ──────────────────────────────────────────
+("*.sv",                    DONT,   "RTL 原始碼"),
+("*.sdc",                   DONT,   "時序約束"),
+("Makefile",                DONT,   "專案設定"),
+("*.prj",                   DONT,   "專案設定"),
+("*.sgdc",                  DONT,   "專案設定"),
+("*.tcl",                   DONT,   "Flow Script"),
+("*.py",                    DONT,   "Flow Script"),
+("*.pl",                    DONT,   "Flow Script"),
+```
+
+]
+
+# *.v 需要特別處理：High Risk（非 RTL 來源時）
+
+# DON’T TOUCH 優先 → 由使用者自行維護 pattern 順序；
+
+# 這裡示範：*.v 列為 High Risk（設計師需人工確認）
+
+RULES.append((”*.v”,           HIGH,   “Netlist/RTL（需人工確認）”))
+RULES.append((”*.vg”,          HIGH,   “Gate-level Netlist”))
+
+# ============================================================
+
+# 比對邏輯
+
+# ============================================================
+
+def classify(name: str) -> tuple[str, str] | None:
+“””
+對單一檔名（或目錄名）套用規則，回傳 (risk_level, description)。
+規則按順序比對，第一個命中的優先（先寫先贏）。
+“””
+for pattern, level, desc in RULES:
+if fnmatch.fnmatch(name, pattern):
+return level, desc
+return None
+
+# ============================================================
+
+# 掃描
+
+# ============================================================
+
+@dataclass
+class FileEntry:
+path: Path
+size: int           # bytes
+mtime: float        # unix timestamp
+level: str
+desc: str
+
+```
+@property
+def size_hr(self) -> str:
+    """human-readable size"""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if self.size < 1024:
+            return f"{self.size:.1f} {unit}"
+        self.size /= 1024
+    return f"{self.size:.1f} PB"
+
+@property
+def mtime_str(self) -> str:
+    return datetime.fromtimestamp(self.mtime).strftime("%Y-%m-%d %H:%M")
+```
+
+def scan(root: Path) -> list[FileEntry]:
+entries: list[FileEntry] = []
+for dirpath, dirnames, filenames in os.walk(root):
+dp = Path(dirpath)
+
+```
+    # 先對目錄名比對（可捕捉 *xcelium.d 之類的目錄）
+    for dname in list(dirnames):
+        result = classify(dname)
+        if result:
+            level, desc = result
+            full = dp / dname
+            try:
+                stat = full.stat()
+                size = sum(
+                    f.stat().st_size
+                    for f in full.rglob("*")
+                    if f.is_file()
+                )
+                entries.append(FileEntry(full, size, stat.st_mtime, level, desc))
+            except PermissionError:
+                pass
+            # 若目錄已命中，不再往下掃其內部（避免重複列出子項）
+            dirnames.remove(dname)
+
+    # 對檔案比對
+    for fname in filenames:
+        result = classify(fname)
+        if result:
+            level, desc = result
+            full = dp / fname
+            try:
+                stat = full.stat()
+                entries.append(FileEntry(full, stat.st_size, stat.st_mtime, level, desc))
+            except PermissionError:
+                pass
+
+return entries
+```
+
+# ============================================================
+
+# 排序
+
+# ============================================================
+
+SORT_KEYS = {
+“SIZE”:  lambda e: e.size,
+“TIME”:  lambda e: e.mtime,
+“LEVEL”: lambda e: LEVEL_ORDER[e.level],
+“PATH”:  lambda e: str(e.path),
+}
+
+def sort_entries(entries: list[FileEntry], by: str) -> list[FileEntry]:
+key = SORT_KEYS.get(by.upper(), SORT_KEYS[“LEVEL”])
+return sorted(entries, key=key)
+
+# ============================================================
+
+# 輸出
+
+# ============================================================
+
+COL_WIDTHS = {
+“size”:  10,
+“time”:  16,
+“level”: 14,
+}
+
+def fmt_row(entry: FileEntry, root: Path) -> str:
+rel = entry.path.relative_to(root)
+symbol = LEVEL_SYMBOL[entry.level]
+level_col = f”{symbol} {entry.level}”
+# 計算 size（可能已被 size_hr 消耗，重新抓）
+stat_size = entry.path.stat().st_size if entry.path.is_file() else entry.size
+size_str = FileEntry(entry.path, stat_size, entry.mtime, entry.level, entry.desc).size_hr
+return (
+f”{size_str:>{COL_WIDTHS[‘size’]}}  “
+f”{entry.mtime_str:<{COL_WIDTHS[‘time’]}}  “
+f”{level_col:<{COL_WIDTHS[‘level’]+3}}  “
+f”{rel}”
+)
+
+HEADER = (
+f”{‘SIZE’:>{COL_WIDTHS[‘size’]}}  “
+f”{‘MODIFIED’:<{COL_WIDTHS[‘time’]}}  “
+f”{‘RISK LEVEL’:<{COL_WIDTHS[‘level’]+3}}  “
+f”PATH”
+)
+SEPARATOR = “-” * 100
+
+def print_report(entries: list[FileEntry], root: Path, output_file: str | None):
+lines = [HEADER, SEPARATOR]
+for e in entries:
+try:
+lines.append(fmt_row(e, root))
+except Exception:
+lines.append(f”{’(error)’:>{COL_WIDTHS[‘size’]}}  {’’:16}  {e.level:<17}  {e.path}”)
+
+```
+lines.append(SEPARATOR)
+
+# 統計
+total_size = sum(e.size for e in entries)
+low_count    = sum(1 for e in entries if e.level == LOW)
+medium_count = sum(1 for e in entries if e.level == MEDIUM)
+high_count   = sum(1 for e in entries if e.level == HIGH)
+dont_count   = sum(1 for e in entries if e.level == DONT)
+
+summary = FileEntry(root, total_size, 0, LOW, "").size_hr  # reuse size formatter
+lines.append(
+    f"共 {len(entries)} 項  |  "
+    f"Low: {low_count}  Medium: {medium_count}  High: {high_count}  DON'T TOUCH: {dont_count}  |  "
+    f"總大小（估）: {summary}"
+)
+
+text = "\n".join(lines)
+print(text)
+
+if output_file:
+    out = Path(output_file)
+    out.write_text(text, encoding="utf-8")
+    print(f"\n✏️  結果已寫入：{out.resolve()}")
+```
+
+# ============================================================
+
+# 刪除（dry-run 預設）
+
+# ============================================================
+
+def do_delete(entries: list[FileEntry], dry_run: bool):
+import shutil
+
+```
+deletable = [e for e in entries if e.level in (LOW, MEDIUM)]
+if not deletable:
+    print("沒有可刪除的項目（High Risk / DON'T TOUCH 不自動刪除）。")
+    return
+
+print(f"\n{'[DRY-RUN] 模擬刪除' if dry_run else '⚠️  真正刪除'} {len(deletable)} 項：\n")
+for e in deletable:
+    tag = "[DRY-RUN]" if dry_run else "[DELETE] "
+    print(f"  {tag} {e.path}")
+    if not dry_run:
+        try:
+            if e.path.is_dir():
+                shutil.rmtree(e.path)
+            else:
+                e.path.unlink()
+        except Exception as ex:
+            print(f"           ❌ 失敗: {ex}")
+
+if dry_run:
+    print("\n（加上 --delete 才會真正執行刪除）")
+```
+
+# ============================================================
+
+# CLI
+
+# ============================================================
+
+def build_parser() -> argparse.ArgumentParser:
+p = argparse.ArgumentParser(
+description=“IC Design 專案檔案清理分類工具”,
+formatter_class=argparse.RawDescriptionHelpFormatter,
+epilog=**doc**,
+)
+p.add_argument(“root”, help=“掃描根目錄”)
+p.add_argument(
+“–output”, metavar=“FILE”, default=None,
+help=“將結果同時寫入檔案”
+)
+p.add_argument(
+“–delete”, action=“store_true”, default=False,
+help=“真正執行刪除（預設為 dry-run，僅列出）”
+)
+p.add_argument(
+“–level”, metavar=“LEVEL”, default=None,
+choices=[“low”, “medium”, “high”, “dont_touch”],
+help=“只顯示指定等級（low / medium / high / dont_touch）”
+)
+p.add_argument(
+“–sort”, metavar=“BY”, default=“LEVEL”,
+choices=[“SIZE”, “TIME”, “LEVEL”, “PATH”],
+help=“排序方式：SIZE / TIME / LEVEL / PATH（預設 LEVEL）”
+)
+return p
+
+LEVEL_MAP = {
+“low”:        LOW,
+“medium”:     MEDIUM,
+“high”:       HIGH,
+“dont_touch”: DONT,
+}
+
+def main():
+parser = build_parser()
+args = parser.parse_args()
+
+```
+root = Path(args.root).resolve()
+if not root.exists():
+    print(f"❌ 目錄不存在：{root}", file=sys.stderr)
+    sys.exit(1)
+
+print(f"🔍 掃描中：{root}\n")
+entries = scan(root)
+
+# 過濾等級
+if args.level:
+    target = LEVEL_MAP[args.level]
+    entries = [e for e in entries if e.level == target]
+
+# 排序
+entries = sort_entries(entries, args.sort)
+
+if not entries:
+    print("沒有符合規則的檔案。")
+    return
+
+# 列出報表
+print_report(entries, root, args.output)
+
+# 刪除（預設 dry-run）
+print()
+do_delete(entries, dry_run=not args.delete)
+```
+
+if **name** == “**main**”:
+main()
