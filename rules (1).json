@@ -1,0 +1,548 @@
+{
+  "_comment": [
+    "IC Cleanup rule file.",
+    "Fields per rule:",
+    "  pattern  (required) : Python regex matched against entry basename",
+    "  type     (required) : 'f'=file only  'd'=dir only  'fd'=both",
+    "  level    (required) : safe | caution | danger | protected | not_current",
+    "  ancestor (optional) : Python regex matched against ANY ancestor dir name",
+    "  desc     (optional) : human-readable label",
+    "",
+    "Rules are evaluated top-to-bottom; first match wins.",
+    "Rule IDs are auto-assigned at load time (R001, R002, ...).",
+    "not_current: sibling pointed to by a 'current*' symlink => KEEP(CURR),",
+    "             all other matching siblings => SAFE(NCUR)."
+  ],
+  "rules": [
+    {
+      "_group": "=== Sim waveforms ==="
+    },
+    {
+      "pattern": ".*\\.fsdb$",
+      "type": "f",
+      "level": "safe",
+      "desc": "sim waveform"
+    },
+    {
+      "pattern": ".*\\.vcd$",
+      "type": "f",
+      "level": "safe",
+      "desc": "sim waveform"
+    },
+    {
+      "pattern": ".*\\.shm$",
+      "type": "f",
+      "level": "safe",
+      "desc": "sim waveform"
+    },
+    {
+      "pattern": ".*\\.vpd$",
+      "type": "f",
+      "level": "safe",
+      "desc": "sim waveform"
+    },
+    {
+      "_group": "=== Sim compile / run cache (global) ==="
+    },
+    {
+      "pattern": ".*INCA_libs$",
+      "type": "d",
+      "level": "safe",
+      "desc": "compile cache dir"
+    },
+    {
+      "pattern": ".*xcelium\\.d$",
+      "type": "d",
+      "level": "safe",
+      "desc": "compile cache dir"
+    },
+    {
+      "pattern": "^csrc$",
+      "type": "d",
+      "level": "safe",
+      "desc": "compile cache dir"
+    },
+    {
+      "pattern": "^simv$",
+      "type": "f",
+      "level": "safe",
+      "desc": "sim binary"
+    },
+    {
+      "pattern": "^simv\\.daidir$",
+      "type": "d",
+      "level": "safe",
+      "desc": "sim binary dir"
+    },
+    {
+      "_group": "=== DFT sim (path-scoped: DFT/Pre_PAR/.../VCS) ==="
+    },
+    {
+      "pattern": "^csrc$",
+      "type": "d",
+      "level": "safe",
+      "ancestor": "VCS",
+      "desc": "DFT sim compile cache"
+    },
+    {
+      "pattern": "^simv\\.daidir$",
+      "type": "d",
+      "level": "safe",
+      "ancestor": "VCS",
+      "desc": "DFT sim binary dir"
+    },
+    {
+      "pattern": "^simv$",
+      "type": "f",
+      "level": "safe",
+      "ancestor": "VCS",
+      "desc": "DFT sim binary"
+    },
+    {
+      "_group": "=== Log files ==="
+    },
+    {
+      "pattern": ".*\\.log$",
+      "type": "f",
+      "level": "safe",
+      "desc": "log file"
+    },
+    {
+      "pattern": ".*sim\\.log$",
+      "type": "f",
+      "level": "safe",
+      "desc": "sim log"
+    },
+    {
+      "_group": "=== Editor / system temp ==="
+    },
+    {
+      "pattern": "^\\..*\\.swp$",
+      "type": "f",
+      "level": "safe",
+      "desc": "vim swap file"
+    },
+    {
+      "pattern": "^crte_.*\\.txt$",
+      "type": "f",
+      "level": "safe",
+      "desc": "crte temp file"
+    },
+    {
+      "pattern": "^work_restore$",
+      "type": "d",
+      "level": "safe",
+      "desc": "work restore dir"
+    },
+    {
+      "pattern": "^WORK$",
+      "type": "d",
+      "level": "safe",
+      "desc": "WORK temp dir"
+    },
+    {
+      "pattern": "^core\\.",
+      "type": "f",
+      "level": "safe",
+      "desc": "system crash dump"
+    },
+    {
+      "_group": "=== STA / PT workspace ==="
+    },
+    {
+      "pattern": "^DMSA_output_",
+      "type": "d",
+      "level": "safe",
+      "desc": "STA workspace"
+    },
+    {
+      "pattern": "^PT_output_",
+      "type": "d",
+      "level": "safe",
+      "desc": "STA workspace"
+    },
+    {
+      "pattern": ".*PT_session$",
+      "type": "d",
+      "level": "safe",
+      "desc": "PT session dir"
+    },
+    {
+      "pattern": ".*PC_session$",
+      "type": "d",
+      "level": "safe",
+      "desc": "PC session dir"
+    },
+    {
+      "pattern": ".*TWK_session$",
+      "type": "d",
+      "level": "safe",
+      "desc": "TWK session dir"
+    },
+    {
+      "pattern": "^report_tweaker$",
+      "type": "d",
+      "level": "safe",
+      "ancestor": "results",
+      "desc": "PT report_tweaker dir"
+    },
+    {
+      "_group": "=== Formality ==="
+    },
+    {
+      "pattern": ".*FM_WORK$",
+      "type": "d",
+      "level": "safe",
+      "desc": "Formality FM_WORK dir"
+    },
+    {
+      "pattern": ".*FM_INFO$",
+      "type": "d",
+      "level": "safe",
+      "desc": "Formality FM_INFO dir"
+    },
+    {
+      "pattern": "^formality_svf$",
+      "type": "fd",
+      "level": "safe",
+      "ancestor": "rpt.*",
+      "desc": "Formality svf under rpt*/"
+    },
+    {
+      "pattern": ".*\\.fss$",
+      "type": "f",
+      "level": "safe",
+      "desc": "Formality .fss file"
+    },
+    {
+      "pattern": ".*\\.svf$",
+      "type": "f",
+      "level": "safe",
+      "desc": "Formality/LEC .svf file"
+    },
+    {
+      "_group": "=== LEC ==="
+    },
+    {
+      "pattern": ".*checkpoint$",
+      "type": "fd",
+      "level": "safe",
+      "desc": "LEC checkpoint"
+    },
+    {
+      "pattern": ".*\\.svf\\.top$",
+      "type": "f",
+      "level": "safe",
+      "desc": "LEC svf.top"
+    },
+    {
+      "pattern": "^nvt_svf\\.tcl$",
+      "type": "f",
+      "level": "safe",
+      "desc": "LEC nvt_svf.tcl"
+    },
+    {
+      "pattern": ".*\\.hier\\.dofile.*",
+      "type": "f",
+      "level": "safe",
+      "desc": "LEC hier dofile"
+    },
+    {
+      "pattern": ".*\\.svf\\.info\\.rpt$",
+      "type": "f",
+      "level": "safe",
+      "ancestor": "rpt.*",
+      "desc": "LEC svf info report"
+    },
+    {
+      "pattern": ".*\\.[^.]*mapped[^.]*\\.rpt$",
+      "type": "f",
+      "level": "safe",
+      "ancestor": "rpt.*",
+      "desc": "LEC mapped report"
+    },
+    {
+      "_group": "=== sg_sdc ==="
+    },
+    {
+      "pattern": "^violation_report\\.rpt$",
+      "type": "f",
+      "level": "safe",
+      "desc": "sg_sdc violation report"
+    },
+    {
+      "pattern": "^vcst_",
+      "type": "fd",
+      "level": "safe",
+      "desc": "sg_sdc vcst_ temp"
+    },
+    {
+      "_group": "=== VCSG_lint ==="
+    },
+    {
+      "pattern": "^vcst_rtdb$",
+      "type": "d",
+      "level": "safe",
+      "desc": "VCSG_lint rtdb"
+    },
+    {
+      "pattern": "^vcst_rtdb\\.bak$",
+      "type": "d",
+      "level": "safe",
+      "desc": "VCSG_lint rtdb backup"
+    },
+    {
+      "pattern": "^lint_cpdb$",
+      "type": "d",
+      "level": "safe",
+      "ancestor": "lint",
+      "desc": "VCSG_lint cpdb"
+    },
+    {
+      "_group": "=== nvtClkExp ==="
+    },
+    {
+      "pattern": "^idbs$",
+      "type": "d",
+      "level": "safe",
+      "desc": "nvtClkExp idbs dir"
+    },
+    {
+      "_group": "=== nvtCHK ==="
+    },
+    {
+      "pattern": "^vsi\\.tar\\.lz4$",
+      "type": "f",
+      "level": "safe",
+      "desc": "nvtCHK archive"
+    },
+    {
+      "_group": "=== SG_pe (power_rtl_files scoped) ==="
+    },
+    {
+      "pattern": "^results$",
+      "type": "d",
+      "level": "safe",
+      "ancestor": "power_rtl_files",
+      "desc": "SG_pe results dir"
+    },
+    {
+      "pattern": "^results_",
+      "type": "d",
+      "level": "safe",
+      "ancestor": "power_rtl_files",
+      "desc": "SG_pe results_* dir"
+    },
+    {
+      "pattern": ".*\\.log$",
+      "type": "f",
+      "level": "safe",
+      "ancestor": "power_rtl_files",
+      "desc": "SG_pe log file"
+    },
+    {
+      "_group": "=== PTPX ==="
+    },
+    {
+      "pattern": ".*\\.power\\.list$",
+      "type": "f",
+      "level": "safe",
+      "desc": "PTPX temp"
+    },
+    {
+      "pattern": ".*\\.timing$",
+      "type": "f",
+      "level": "safe",
+      "desc": "PTPX temp"
+    },
+    {
+      "_group": "=== Verdi ==="
+    },
+    {
+      "pattern": "^VerdiLog$",
+      "type": "d",
+      "level": "safe",
+      "desc": "Verdi log dir"
+    },
+    {
+      "_group": "=== SG_SaveRestoreDB ==="
+    },
+    {
+      "pattern": ".*\\.sdb$",
+      "type": "f",
+      "level": "safe",
+      "ancestor": "^\\.SG_SaveRestoreDB$",
+      "desc": "SG SaveRestore DB file"
+    },
+    {
+      "_group": "=== Caution: keep newest, delete old ==="
+    },
+    {
+      "pattern": ".*\\.ddc$",
+      "type": "f",
+      "level": "safe",
+      "desc": "synthesis snapshot"
+    },
+    {
+      "pattern": ".*\\.saif$",
+      "type": "f",
+      "level": "gzip",
+      "desc": "power activity file"
+    },
+    {
+      "pattern": ".*\\.bit$",
+      "type": "f",
+      "level": "safe",
+      "desc": "FPGA bitstream"
+    },
+    {
+      "pattern": ".*\\.bin$",
+      "type": "f",
+      "level": "safe",
+      "desc": "FPGA bitstream"
+    },
+    {
+      "pattern": ".*\\.mcs$",
+      "type": "f",
+      "level": "safe",
+      "desc": "FPGA bitstream"
+    },
+    {
+      "pattern": ".*\\.pat$",
+      "type": "f",
+      "level": "safe",
+      "desc": "DFT pattern"
+    },
+    {
+      "pattern": ".*\\.spef$",
+      "type": "f",
+      "level": "safe",
+      "desc": "P&R parasitics"
+    },
+    {
+      "_group": "=== Danger: manual confirm ==="
+    },
+    {
+      "pattern": ".*\\.v$",
+      "type": "f",
+      "level": "protected",
+      "desc": "netlist/RTL (manual confirm)"
+    },
+    {
+      "pattern": ".*\\.vg$",
+      "type": "f",
+      "level": "protected",
+      "desc": "gate-level netlist"
+    },
+    {
+      "pattern": "^report_qor\\.rpt$",
+      "type": "f",
+      "level": "protected",
+      "desc": "STA signoff report"
+    },
+    {
+      "pattern": "^summary_.*\\.rpt$",
+      "type": "f",
+      "level": "protected",
+      "desc": "STA signoff summary"
+    },
+    {
+      "pattern": ".*_final\\.gds$",
+      "type": "f",
+      "level": "protected",
+      "desc": "P&R final GDS"
+    },
+    {
+      "pattern": "^ptpx_final",
+      "type": "fd",
+      "level": "protected",
+      "desc": "power signoff"
+    },
+    {
+      "_group": "=== Not-current: versioned dirs protected by 'current' symlink ==="
+    },
+    {
+      "pattern": "^\\d{6}.*$",
+      "type": "d",
+      "level": "not_current",
+      "ancestor": ".*MACRO.*",
+      "desc": "MACRO versioned snapshot"
+    },
+    {
+      "pattern": "^DC_output_",
+      "type": "d",
+      "level": "not_current",
+      "desc": "DC output snapshot"
+    },
+    {
+      "pattern": "^FC_output_",
+      "type": "d",
+      "level": "not_current",
+      "desc": "FC output snapshot"
+    },
+    {
+      "pattern": "^vec$",
+      "type": "d",
+      "level": "not_current",
+      "ancestor": ".*atpg",
+      "desc": "ATPG vec folder"
+    },
+    {
+      "pattern": "^PC_output",
+      "type": "d",
+      "level": "not_current",
+      "desc": "P&R PC_output snapshot"
+    },
+    {
+      "_group": "=== Protected: never delete ==="
+    },
+    {
+      "pattern": ".*\\.sv$",
+      "type": "f",
+      "level": "protected",
+      "desc": "RTL source"
+    },
+    {
+      "pattern": ".*\\.sdc$",
+      "type": "f",
+      "level": "protected",
+      "desc": "timing constraints"
+    },
+    {
+      "pattern": "^Makefile(\\.rtl)?$",
+      "type": "f",
+      "level": "protected",
+      "desc": "project config / Makefile.rtl"
+    },
+    {
+      "pattern": ".*\\.prj$",
+      "type": "f",
+      "level": "protected",
+      "desc": "project config"
+    },
+    {
+      "pattern": ".*\\.sgdc$",
+      "type": "f",
+      "level": "protected",
+      "desc": "project config"
+    },
+    {
+      "pattern": ".*\\.tcl$",
+      "type": "f",
+      "level": "protected",
+      "desc": "flow script"
+    },
+    {
+      "pattern": ".*\\.py$",
+      "type": "f",
+      "level": "protected",
+      "desc": "flow script"
+    },
+    {
+      "pattern": ".*\\.pl$",
+      "type": "f",
+      "level": "protected",
+      "desc": "flow script"
+    }
+  ]
+}
