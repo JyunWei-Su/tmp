@@ -6,41 +6,35 @@ Usage:
     ic_cleanup.py <scan_root> [options]
 
 Options:
-    --rules FILE         JSON rule file (default: rules.json beside this script)
-    --out-dir DIR        Write all logs under DIR:
-                           DIR/trace.log   -- scan results  (with rule IDs)
-                           DIR/delete.log  -- delete actions
-                           DIR/error.log   -- filesystem errors
-                           DIR/rule.log    -- loaded rule table with IDs
-    --gz                 Compress all --out-dir logs with gzip (.log.gz)
-    --log-trace  FILE    Scan trace log  (overrides --out-dir; .gz = gzip)
-    --log-delete FILE    Delete log      (overrides --out-dir; .gz = gzip)
-    --log-error  FILE    Error log       (overrides --out-dir; .gz = gzip)
-    --log-rule   FILE    Rule table log  (overrides --out-dir; .gz = gzip)
-    --delete             Actually delete files (default: dry-run, list only)
-    --level LEVEL [...]  Show only specific risk level(s):
-                           safe | caution | danger | protected | not_current
+    --rules FILE     JSON rule file (default: rules.json beside this script)
+    --out-dir DIR    Write all logs under DIR:
+                       trace.log   -- scan results with rule IDs
+                       delete.log  -- delete / gzip actions
+                       error.log   -- filesystem errors
+                       rule.log    -- loaded rule table
+                       summary.log -- per-rule hit counts + action statistics
+                       svndir.log  -- SVN working copy dirs found (not scanned inside)
+    --gz             Compress all --out-dir logs with gzip (.log.gz)
+    --delete         Actually perform actions (delete / gzip); default: dry-run
 
-Rule JSON format (see rules.json):
-    {
-      "rules": [
-        {
-          "pattern":  "<Python regex against basename>",   required
-          "type":     "f" | "d" | "fd",                   required
-          "level":    "safe|caution|danger|protected|not_current",  required
-          "ancestor": "<Python regex against any ancestor dir>",    optional
-          "desc":     "<human label>"                               optional
-        },
-        ...
-      ]
-    }
-    Rules are evaluated top-to-bottom; first match wins.
-    Rule IDs (R001, R002, ...) are auto-assigned after loading.
-    Every matched item records its rule ID in all logs.
+Levels:
+    safe        -- delete the file/dir
+    gzip        -- gzip file (*.gz same dir); dir -> tar.gz at parent, remove original
+                   if .gz/.tar.gz already exists: skip
+    protected   -- never touched
+    not_current -- sibling of a 'current*' symlink target: KEEP(CURR) / protected
+                   all others: SAFE(NCUR) / deleted like safe
+
+JSON rule fields:
+    pattern  (required) : Python regex against basename
+    type     (required) : f | d | fd
+    level    (required) : safe | gzip | protected | not_current
+    ancestor (optional) : Python regex against any ancestor dir name
+    desc     (optional) : label
 """
 
 import argparse
-import gzip
+import gzip as _gzip_mod
 import io
 import json
 import os
@@ -49,6 +43,7 @@ import re
 import shutil
 import signal
 import sys
+import tarfile
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -67,6 +62,7 @@ _ANSI = {
     "red":    "\033[31m",
     "cyan":   "\033[36m",
     "blue":   "\033[34m",
+    "magenta":"\033[35m",
 }
 
 
@@ -81,53 +77,69 @@ def _c(text, *codes):
 # ===========================================================================
 #  Risk level constants
 # ===========================================================================
-SAFE        = "Safe"
-CAUTION     = "Caution"
-DANGER      = "Danger"
-PROTECTED   = "Protected"
-NOT_CURRENT = "Not-Current"
+SAFE    = "Safe"        # delete
+GZIP    = "Gzip"        # compress, delete original
+PROTECTED = "Protected" # never touch
+CURRENT   = "Current"   # depends on current symlink (renamed from Not-Current)
 
-ALL_LEVELS = (SAFE, CAUTION, DANGER, PROTECTED, NOT_CURRENT)
+ALL_LEVELS = (SAFE, GZIP, PROTECTED, CURRENT)
 
-_NCUR_SAFE = "__NCUR_SAFE__"
-_NCUR_KEEP = "__NCUR_KEEP__"
+# Internal sentinels for current outcomes
+_NCUR_SAFE = "__NCUR_SAFE__"   # no current symlink -> deletable (like SAFE)
+_NCUR_KEEP = "__NCUR_KEEP__"   # pointed to by current symlink -> keep
+
+# ---------------------------------------------------------------------------
+#  Tags -- ALL exactly 12 characters (including brackets)
+#  Format: "[XXXXXXXXXXXX]" but we keep them at 12 chars total
+#  Rule: every tag is padded/trimmed to exactly _TAG_W chars
+# ---------------------------------------------------------------------------
+_TAG_W = 12   # fixed tag column width, must match all entries below
 
 _PLAIN = {
-    SAFE:        "[SAFE    ]  ",
-    CAUTION:     "[CAUTION ]  ",
-    DANGER:      "[DANGER  ]  ",
-    PROTECTED:   "[PROTECT ]  ",
-    NOT_CURRENT: "[KEEP(CURR)]",
-    _NCUR_SAFE:  "[SAFE(NCUR)]",
-    _NCUR_KEEP:  "[KEEP(CURR)]",
+    SAFE:      "[SAFE    ]  ",   # 12
+    GZIP:      "[GZIP    ]  ",   # 12
+    PROTECTED: "[PROTECT ]  ",   # 12
+    CURRENT:   "[KEEP(CURR)]",   # 12  -- the "current" target: protected
+    _NCUR_SAFE:"[SAFE(NCUR)]",   # 12  -- no current symlink: deletable
+    _NCUR_KEEP:"[KEEP(CURR)]",   # 12  -- current target: keep
 }
 
-_tag_lengths = {k: len(v) for k, v in _PLAIN.items()}
-assert len(set(_tag_lengths.values())) == 1, \
-    "Tag width mismatch: {}".format(_tag_lengths)
+_tl = set(len(v) for v in _PLAIN.values())
+assert len(_tl) == 1 and list(_tl)[0] == _TAG_W, \
+    "Tag width mismatch: {}".format({k: len(v) for k, v in _PLAIN.items()})
 
 _COLOR = {
-    SAFE:        _c(_PLAIN[SAFE],        "green",  "bold"),
-    CAUTION:     _c(_PLAIN[CAUTION],     "yellow", "bold"),
-    DANGER:      _c(_PLAIN[DANGER],      "red",    "bold"),
-    PROTECTED:   _c(_PLAIN[PROTECTED],   "cyan",   "bold"),
-    NOT_CURRENT: _c(_PLAIN[NOT_CURRENT], "blue",   "bold"),
-    _NCUR_SAFE:  _c(_PLAIN[_NCUR_SAFE],  "green",  "bold"),
-    _NCUR_KEEP:  _c(_PLAIN[_NCUR_KEEP],  "blue",   "bold"),
+    SAFE:      _c(_PLAIN[SAFE],      "green",   "bold"),
+    GZIP:      _c(_PLAIN[GZIP],      "magenta", "bold"),
+    PROTECTED: _c(_PLAIN[PROTECTED], "cyan",    "bold"),
+    CURRENT:   _c(_PLAIN[CURRENT],   "blue",    "bold"),
+    _NCUR_SAFE:_c(_PLAIN[_NCUR_SAFE],"green",   "bold"),
+    _NCUR_KEEP:_c(_PLAIN[_NCUR_KEEP],"blue",    "bold"),
 }
 
-_DELETABLE = (SAFE, CAUTION)
+# SVN implicit rule -- same 12-char width
+_PLAIN_SVN = "[SVN-WC  ]  "   # 12
+assert len(_PLAIN_SVN) == _TAG_W, "SVN tag width mismatch"
+_COLOR_SVN = _c(_PLAIN_SVN, "yellow", "bold")
 
-# Map JSON level string -> internal constant
+# levels that result in an action (delete or gzip)
+_ACTIONABLE = (SAFE, GZIP)
+
+# Map JSON level string -> constant
 _LEVEL_FROM_JSON = {
     "safe":        SAFE,
-    "caution":     CAUTION,
-    "danger":      DANGER,
+    "gzip":        GZIP,
     "protected":   PROTECTED,
-    "not_current": NOT_CURRENT,
+    "not_current": CURRENT,   # JSON still uses not_current for back-compat
+    "current":     CURRENT,   # also accept "current" directly
 }
 
-LEVEL_MAP = _LEVEL_FROM_JSON   # alias for CLI --level filter
+LEVEL_MAP = {
+    "safe":      SAFE,
+    "gzip":      GZIP,
+    "protected": PROTECTED,
+    "current":   CURRENT,
+}
 
 
 def _effective_level(internal):
@@ -135,7 +147,7 @@ def _effective_level(internal):
     if internal == _NCUR_SAFE:
         return SAFE
     if internal == _NCUR_KEEP:
-        return NOT_CURRENT
+        return CURRENT
     return internal
 
 
@@ -150,19 +162,13 @@ def _tag_color(internal):
 
 
 # ===========================================================================
-#  Rule loading from JSON
-#  After loading, every rule dict gets:
-#    "id"          : "R001", "R002", ...
-#    "_pat_re"     : compiled pattern regex
-#    "_ancestor_re": compiled ancestor regex or None
+#  Rule loading
 # ===========================================================================
 RULES = []  # type: List[Dict]
 
 
 def load_rules(json_path):
     # type: (str) -> List[Dict]
-    """Load rules from a JSON file, assign IDs, compile regexes.
-    Raises SystemExit on any error so the caller doesn't need to check."""
     try:
         with open(json_path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -173,13 +179,17 @@ def load_rules(json_path):
 
     raw = data.get("rules")
     if not isinstance(raw, list) or not raw:
-        print("ERROR: rules.json must contain a non-empty 'rules' list",
+        print("ERROR: rules.json must have a non-empty 'rules' list",
               file=sys.stderr)
         sys.exit(1)
 
     loaded = []  # type: List[Dict]
-    for idx, entry in enumerate(raw, start=1):
-        rule_id  = "R{:03d}".format(idx)
+    rule_num = 0
+    for entry in raw:
+        if "pattern" not in entry:   # skip _group / _comment entries
+            continue
+        rule_num += 1
+        rule_id  = "R{:03d}".format(rule_num)
         pattern  = entry.get("pattern", "")
         rtype    = entry.get("type",    "fd")
         level_s  = entry.get("level",  "safe").lower().replace("-", "_")
@@ -187,14 +197,14 @@ def load_rules(json_path):
         desc     = entry.get("desc", "")
 
         if level_s not in _LEVEL_FROM_JSON:
-            print("ERROR: rule {} has unknown level '{}' (valid: {})".format(
+            print("ERROR: rule {} unknown level '{}' (valid: {})".format(
                 rule_id, level_s, list(_LEVEL_FROM_JSON.keys())), file=sys.stderr)
             sys.exit(1)
 
         try:
             pat_re = re.compile(pattern)
         except re.error as exc:
-            print("ERROR: rule {} pattern '{}' is invalid regex: {}".format(
+            print("ERROR: rule {} pattern '{}': {}".format(
                 rule_id, pattern, exc), file=sys.stderr)
             sys.exit(1)
 
@@ -203,7 +213,7 @@ def load_rules(json_path):
             try:
                 anc_re = re.compile(ancestor)
             except re.error as exc:
-                print("ERROR: rule {} ancestor '{}' is invalid regex: {}".format(
+                print("ERROR: rule {} ancestor '{}': {}".format(
                     rule_id, ancestor, exc), file=sys.stderr)
                 sys.exit(1)
 
@@ -223,33 +233,27 @@ def load_rules(json_path):
 
 def write_rule_log(rules, fh):
     # type: (List[Dict], object) -> None
-    """Write the loaded rule table (with IDs) to a log file handle."""
     if fh is None:
         return
     _write_fh(fh, "# IC Cleanup -- rule table")
-    _write_fh(fh, "# Generated: {}".format(
+    _write_fh(fh, "# Generated : {}".format(
         datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-    _write_fh(fh, "# Total rules: {}".format(len(rules)))
+    _write_fh(fh, "# Total     : {}".format(len(rules)))
     _write_fh(fh, "")
-    hdr = "{:<6}  {:<12}  {:<4}  {:<20}  {:<30}  {}".format(
+    hdr = "{:<6}  {:<12}  {:<4}  {:<24}  {:<32}  {}".format(
         "ID", "LEVEL", "TYPE", "ANCESTOR", "DESC", "PATTERN")
-    sep = "-" * 100
+    sep = "-" * 110
     _write_fh(fh, hdr)
     _write_fh(fh, sep)
     for r in rules:
-        _write_fh(fh, "{:<6}  {:<12}  {:<4}  {:<20}  {:<30}  {}".format(
-            r["id"],
-            r["level"],
-            r["type"],
-            r["ancestor"] or "(any)",
-            r["desc"],
-            r["pattern"],
-        ))
+        _write_fh(fh, "{:<6}  {:<12}  {:<4}  {:<24}  {:<32}  {}".format(
+            r["id"], r["level"], r["type"],
+            r["ancestor"] or "(any)", r["desc"], r["pattern"]))
     _write_fh(fh, sep)
 
 
 # ===========================================================================
-#  Ancestor path check
+#  Ancestor check
 # ===========================================================================
 def has_ancestor_match(entry_abs, ancestor_re):
     # type: (Path, re.Pattern) -> bool
@@ -296,7 +300,7 @@ def get_current_targets(parent):
 
 
 # ===========================================================================
-#  Classification  -- returns (internal_sentinel, desc, rule_id) or None
+#  Classification  ->  (internal, desc, rule_id)  or  None
 # ===========================================================================
 def classify(name, parent, is_dir):
     # type: (str, Path, bool) -> Optional[Tuple[str, str, str]]
@@ -316,7 +320,7 @@ def classify(name, parent, is_dir):
         desc    = rule.get("desc", "")
         rule_id = rule["id"]
 
-        if level == NOT_CURRENT:
+        if level == CURRENT:
             if name in get_current_targets(parent):
                 return _NCUR_KEEP, desc, rule_id
             return _NCUR_SAFE, desc, rule_id
@@ -363,9 +367,6 @@ def fmt_mtime(ts):
 
 def dir_total_size(path):
     # type: (Path) -> int
-    """Full recursive size via stack-based scandir.
-    Checks _interrupted at every Python iteration so Ctrl-C is responsive.
-    Returns -1 if interrupted before completion."""
     total  = 0
     stack  = [str(path)]
     while stack:
@@ -390,13 +391,12 @@ def dir_total_size(path):
     return total
 
 
-# ---------------------------------------------------------------------------
-#  Column layout
-#  RULE column is fixed at 6 chars ("R001  " etc.) -- same as rule ID width
-# ---------------------------------------------------------------------------
-_TAG_COL_W   = len(list(_PLAIN.values())[0])
+SVN_RULE_ID   = "SVN"
+SVN_LEVEL_STR = "Svn-WC"
+
+_TAG_COL_W   = _TAG_W    # already defined above as 12
 _OWNER_WIDTH = 12
-_RULE_WIDTH  = 6    # "R001" + 2 spaces padding handled by format spec
+_RULE_WIDTH  = 6
 
 HEADER_PLAIN = "{:>12}  {:<16}  {:<{tw}}  {:<{ow}}  {:<4}  {:<{rw}}  {}".format(
     "SIZE", "MODIFIED", "LEVEL", "OWNER", "TYPE", "RULE", "PATH",
@@ -410,20 +410,14 @@ def fmt_row(size, mtime, internal, owner, ftype, rule_id, abs_path, for_file=Fal
     tag       = _tag_plain(internal) if for_file else _tag_color(internal)
     ftype_str = "DIR " if ftype == "D" else "FILE"
     return "{:>12}  {:<16}  {}  {:<{ow}}  {:<4}  {:<{rw}}  {}".format(
-        human_size(size),
-        fmt_mtime(mtime),
-        tag,
-        owner,
-        ftype_str,
-        rule_id,
-        abs_path,
-        ow=_OWNER_WIDTH,
-        rw=_RULE_WIDTH,
+        human_size(size), fmt_mtime(mtime), tag,
+        owner, ftype_str, rule_id, abs_path,
+        ow=_OWNER_WIDTH, rw=_RULE_WIDTH,
     )
 
 
 # ===========================================================================
-#  Progress line on stderr
+#  Progress line
 # ===========================================================================
 _TERM_WIDTH = shutil.get_terminal_size((120, 24)).columns
 
@@ -453,12 +447,10 @@ def _clear_progress():
 # ===========================================================================
 def open_log(path):
     # type: (str) -> object
-    """Open a log for line-by-line UTF-8 writing.
-    .gz suffix -> vim-compatible single-stream gzip (mtime=0)."""
     if path.endswith(".gz"):
         raw = open(path, "wb")
-        gz  = gzip.GzipFile(filename="", mode="wb", compresslevel=6,
-                             fileobj=raw, mtime=0)
+        gz  = _gzip_mod.GzipFile(filename="", mode="wb", compresslevel=6,
+                                  fileobj=raw, mtime=0)
         return io.TextIOWrapper(gz, encoding="utf-8")
     return open(path, "w", encoding="utf-8")
 
@@ -490,9 +482,7 @@ def _handle_sigint(signum, frame):
     _interrupted = True
     _clear_progress()
     sys.stderr.write(
-        _c("\n[INTERRUPTED] Ctrl-C caught -- "
-           "stopping scan, printing partial results...\n", "yellow", "bold")
-    )
+        _c("\n[INTERRUPTED] Ctrl-C caught -- stopping scan...\n", "yellow", "bold"))
     sys.stderr.flush()
 
 
@@ -501,7 +491,7 @@ def _install_sigint_handler():
 
 
 # ===========================================================================
-#  Error logging helper
+#  Error logging
 # ===========================================================================
 def _log_error(error_fh, path, exc):
     # type: (object, str, Exception) -> None
@@ -513,13 +503,86 @@ def _log_error(error_fh, path, exc):
 
 
 # ===========================================================================
-#  Streaming scan
+#  Statistics tracker
+#  Tracks per-rule hit counts and per-action (delete/gzip) counts + sizes.
 # ===========================================================================
-def scan_and_print(root, level_filter, scan_fh, error_fh, trace_path, error_path):
-    # type: (Path, Optional[Set[str]], object, object, str, str) -> List[Tuple]
+class Stats(object):
+    def __init__(self, rules):
+        # type: (List[Dict]) -> None
+        # rule_id -> {hits, size}
+        self.rule_hits = {r["id"]: {"hits": 0, "size": 0} for r in rules}
+        # SVN working copy hits (implicit rule)
+        self.svn_count = 0
+        self.svn_size  = 0
+        # action counts (populated during do_actions)
+        self.deleted_count  = 0
+        self.deleted_size   = 0
+        self.gzipped_count  = 0
+        self.gzipped_size   = 0
+        self.skipped_count  = 0   # gz already exists
+        self.error_count    = 0
+
+    def record_scan(self, rule_id, size):
+        # type: (str, int) -> None
+        if rule_id in self.rule_hits:
+            self.rule_hits[rule_id]["hits"] += 1
+            self.rule_hits[rule_id]["size"] += max(size, 0)
+
+    def record_svn(self, size):
+        # type: (int) -> None
+        self.svn_count += 1
+        self.svn_size  += max(size, 0)
+
+
+# ===========================================================================
+#  SVN working copy detection
+# ===========================================================================
+SVN_HEADER_PLAIN = HEADER_PLAIN   # reuse the same header
+SVN_SEP          = SEP
+
+
+def is_svn_wc(dirpath):
+    # type: (Path) -> bool
+    """Return True if dirpath contains a .svn subdirectory."""
+    try:
+        return (dirpath / ".svn").is_dir()
+    except OSError:
+        return False
+
+
+def emit_svn_row(size, mtime, owner, abs_path, svn_fh, scan_fh, cur_dir):
+    # type: (int, float, str, str, object, object, str) -> None
+    """Emit one SVN-WC row using the same column layout as fmt_row."""
+    # Use _PLAIN_SVN as the internal key for both plain and color tags
+    plain_row = "{:>12}  {:<16}  {}  {:<{ow}}  {:<4}  {:<{rw}}  {}".format(
+        human_size(size), fmt_mtime(mtime),
+        _PLAIN_SVN,          # plain tag (12 chars)
+        owner, "DIR ",
+        SVN_RULE_ID,         # "SVN"
+        abs_path,
+        ow=_OWNER_WIDTH, rw=_RULE_WIDTH,
+    )
+    color_row = "{:>12}  {:<16}  {}  {:<{ow}}  {:<4}  {:<{rw}}  {}".format(
+        human_size(size), fmt_mtime(mtime),
+        _COLOR_SVN,          # colored tag
+        owner, "DIR ",
+        SVN_RULE_ID,
+        abs_path,
+        ow=_OWNER_WIDTH, rw=_RULE_WIDTH,
+    )
+    _clear_progress()
+    print(color_row)
+    _write_fh(scan_fh, plain_row)
+    _write_fh(svn_fh,  plain_row)
+    if cur_dir:
+        _progress(cur_dir)
+def scan_and_print(root, level_filter, scan_fh, error_fh, svn_fh,
+                   trace_path, error_path, svn_path, stats):
+    # type: (Path, Optional[Set[str]], object, object, object, str, str, str, Stats) -> List[Tuple]
     """
     Result tuples:
       (size, mtime, effective_level, internal, owner, ftype, rule_id, abs_path)
+    SVN working copy dirs are recorded separately and NOT included in results.
     """
     root_real = Path(os.path.realpath(str(root)))
 
@@ -531,14 +594,15 @@ def scan_and_print(root, level_filter, scan_fh, error_fh, trace_path, error_path
 
     print(_c("  log-trace : {}".format(trace_path if trace_path else "(none)"), "dim"))
     print(_c("  log-error : {}".format(error_path if error_path else "(none)"), "dim"))
+    print(_c("  log-svndir: {}".format(svn_path   if svn_path   else "(none)"), "dim"))
     print()
 
     results = []   # type: List[Tuple]
     counts  = {lv: 0 for lv in ALL_LEVELS}  # type: Dict[str, int]
     cur_dir = ""
 
-    for dirpath, dirnames, filenames in os.walk(str(root), followlinks=False,
-                                                onerror=lambda e: None):
+    for dirpath, dirnames, filenames in os.walk(
+            str(root), followlinks=False, onerror=lambda e: None):
         if _interrupted:
             dirnames[:] = []
             break
@@ -551,24 +615,40 @@ def scan_and_print(root, level_filter, scan_fh, error_fh, trace_path, error_path
         for dname in list(dirnames):
             if _interrupted:
                 break
-
             full = dp / dname
             try:
-                is_sym = full.is_symlink()
+                if full.is_symlink():
+                    continue
             except OSError as exc:
                 _log_error(error_fh, str(full), exc)
                 dirnames.remove(dname)
                 continue
-            if is_sym:
+
+            # --- SVN working copy detection (implicit rule, highest priority) ---
+            if is_svn_wc(full):
+                dirnames.remove(dname)   # do not descend
+                try:
+                    st    = full.stat()
+                    mt    = st.st_mtime
+                    owner = get_owner(full)
+                    # Use the directory inode's st_size -- instant, no recursion.
+                    # This reflects the dir entry size (typically 4 KB per dir level),
+                    # not the full content size.  Accurate content size would require
+                    # recursion which causes hangs on large SVN repos.
+                    size  = st.st_size
+                except OSError as exc:
+                    _log_error(error_fh, str(full), exc)
+                    continue
+                abs_path = str(root_real / full.relative_to(root))
+                emit_svn_row(size, mt, owner, abs_path, svn_fh, scan_fh, cur_dir)
+                stats.record_svn(size)
                 continue
 
             result = classify(dname, dp, is_dir=True)
             if result is None:
                 continue
-
             internal, _desc, rule_id = result
             effective = _effective_level(internal)
-
             dirnames.remove(dname)
 
             if level_filter and effective not in level_filter:
@@ -591,8 +671,7 @@ def scan_and_print(root, level_filter, scan_fh, error_fh, trace_path, error_path
                 owner = get_owner(full)
             except OSError as exc:
                 _log_error(error_fh, str(full), exc)
-                mt    = 0.0
-                owner = "?"
+                mt, owner = 0.0, "?"
 
             abs_path = str(root_real / full.relative_to(root))
             emit_row(
@@ -602,25 +681,23 @@ def scan_and_print(root, level_filter, scan_fh, error_fh, trace_path, error_path
             )
             results.append((size, mt, effective, internal, owner, "D", rule_id, Path(abs_path)))
             counts[effective] += 1
+            stats.record_scan(rule_id, size)
 
         # --- files ---
         for fname in filenames:
             if _interrupted:
                 break
-
             full = dp / fname
             try:
-                is_sym = full.is_symlink()
+                if full.is_symlink():
+                    continue
             except OSError as exc:
                 _log_error(error_fh, str(full), exc)
-                continue
-            if is_sym:
                 continue
 
             result = classify(fname, dp, is_dir=False)
             if result is None:
                 continue
-
             internal, _desc, rule_id = result
             effective = _effective_level(internal)
 
@@ -644,6 +721,7 @@ def scan_and_print(root, level_filter, scan_fh, error_fh, trace_path, error_path
             )
             results.append((size, mt, effective, internal, owner, "F", rule_id, Path(abs_path)))
             counts[effective] += 1
+            stats.record_scan(rule_id, size)
 
     _clear_progress()
 
@@ -653,12 +731,12 @@ def scan_and_print(root, level_filter, scan_fh, error_fh, trace_path, error_path
 
     summary = (
         "Total {} items  |  "
-        "Safe: {}  Caution: {}  Danger: {}  Protected: {}  Keep: {}  |  "
+        "Safe: {}  Gzip: {}  Protected: {}  Current(keep): {}  SVN-WC: {}  |  "
         "Est. size: {}{}"
     ).format(
         total_count,
-        counts[SAFE], counts[CAUTION], counts[DANGER],
-        counts[PROTECTED], counts[NOT_CURRENT],
+        counts[SAFE], counts[GZIP], counts[PROTECTED], counts[CURRENT],
+        stats.svn_count,
         human_size(total_size), partial,
     )
 
@@ -671,40 +749,84 @@ def scan_and_print(root, level_filter, scan_fh, error_fh, trace_path, error_path
 
 
 # ===========================================================================
-#  Delete
+#  Gzip action helpers
 # ===========================================================================
-def do_delete(results, dry_run, delete_fh, error_fh, delete_path):
-    # type: (List[Tuple], bool, object, object, str) -> None
-    deletable = [r for r in results if r[2] in _DELETABLE]
+def _gzip_file(src_path, error_fh):
+    # type: (Path, object) -> Tuple[str, int]
+    """Gzip a single file in-place.  Returns (status, bytes_saved).
+    status: 'OK' | 'SKIP' | 'ERROR: ...'"""
+    gz_path = Path(str(src_path) + ".gz")
+    if gz_path.exists():
+        return "SKIP", 0
+    try:
+        orig_size = src_path.stat().st_size
+        with open(str(src_path), "rb") as f_in:
+            raw = open(str(gz_path), "wb")
+            gz  = _gzip_mod.GzipFile(filename="", mode="wb",
+                                     compresslevel=6, fileobj=raw, mtime=0)
+            shutil.copyfileobj(f_in, gz)
+            gz.close()
+            raw.close()
+        src_path.unlink()
+        return "OK", orig_size
+    except Exception as exc:
+        _log_error(error_fh, str(src_path), exc)
+        return "ERROR: {}".format(exc), 0
 
-    if not deletable:
-        msg = "\nNothing to delete. (Danger / Protected / Keep are never auto-deleted.)"
+
+def _gzip_dir(src_path, error_fh):
+    # type: (Path, object) -> Tuple[str, int]
+    """Tar+gzip a directory.  tar.gz placed at parent.  Original removed.
+    Returns (status, bytes_saved)."""
+    tar_path = src_path.parent / (src_path.name + ".tar.gz")
+    if tar_path.exists():
+        return "SKIP", 0
+    try:
+        orig_size = dir_total_size(src_path)
+        if orig_size == -1:
+            return "INTERRUPTED", 0
+        with tarfile.open(str(tar_path), "w:gz") as tf:
+            tf.add(str(src_path), arcname=src_path.name)
+        shutil.rmtree(str(src_path))
+        return "OK", orig_size
+    except Exception as exc:
+        _log_error(error_fh, str(src_path), exc)
+        return "ERROR: {}".format(exc), 0
+
+
+# ===========================================================================
+#  Actions (delete / gzip)
+# ===========================================================================
+def do_actions(results, dry_run, delete_fh, error_fh, delete_path, stats):
+    # type: (List[Tuple], bool, object, object, str, Stats) -> None
+    actionable = [r for r in results if r[2] in _ACTIONABLE]
+
+    if not actionable:
+        msg = "\nNothing to act on. (Protected / Keep are never touched.)"
         print(msg)
         _write_fh(delete_fh, msg)
         return
 
-    mode      = "DRY-RUN" if dry_run else "DELETE"
+    mode      = "DRY-RUN" if dry_run else "EXECUTE"
     ts        = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     tag_term  = _c("[{}]".format(mode), "yellow" if dry_run else "red", "bold")
     tag_plain = "[{}]".format(mode)
 
-    print("\n{}  {} items eligible (Safe + Caution only):".format(
-        tag_term, len(deletable)))
+    print("\n{}  {} items to act on (Safe=delete, Gzip=compress):".format(
+        tag_term, len(actionable)))
     print(_c("  log-delete: {}".format(delete_path if delete_path else "(none)"), "dim"))
     print()
 
-    _write_fh(delete_fh, "# IC Cleanup -- delete log")
+    _write_fh(delete_fh, "# IC Cleanup -- action log")
     _write_fh(delete_fh, "# Date : {}".format(ts))
     _write_fh(delete_fh, "# Mode : {}".format(mode))
-    _write_fh(delete_fh, "\n{} {} items eligible (Safe + Caution only):".format(
-        tag_plain, len(deletable)))
     _write_fh(delete_fh, SEP)
-    _write_fh(delete_fh, HEADER_PLAIN)
+    _write_fh(delete_fh, HEADER_PLAIN + "  ACTION  STATUS")
     _write_fh(delete_fh, SEP)
 
-    for _size, _mt, effective, internal, owner, ftype, rule_id, path in deletable:
+    for _size, _mt, effective, internal, owner, ftype, rule_id, path in actionable:
         if _interrupted:
-            msg = "  [INTERRUPTED] delete aborted."
+            msg = "  [INTERRUPTED] actions aborted."
             print(_c(msg, "yellow"))
             _write_fh(delete_fh, msg)
             break
@@ -714,33 +836,159 @@ def do_delete(results, dry_run, delete_fh, error_fh, delete_path):
         row_term  = fmt_row(_size, _mt, internal, owner, ftype, rule_id,
                             str(path), for_file=False)
 
-        status = "OK"
-        if not dry_run:
-            try:
-                if path.is_dir():
-                    shutil.rmtree(str(path))
-                else:
-                    path.unlink()
-            except Exception as exc:
-                status = "ERROR: {}".format(exc)
-                _log_error(error_fh, str(path), exc)  # type: ignore[arg-type]
+        action = "GZIP" if effective == GZIP else "DELETE"
+        status = "DRY-RUN"
 
-        print("  {}  {}".format(tag_term, row_term))
-        if status != "OK":
-            print(_c("             {}".format(status), "red"))
-            _write_fh(delete_fh, row_plain + "  -> " + status)
-        else:
-            _write_fh(delete_fh, row_plain)
+        if not dry_run:
+            if effective == GZIP:
+                if ftype == "D":
+                    status, saved = _gzip_dir(path, error_fh)
+                else:
+                    status, saved = _gzip_file(path, error_fh)
+                if status == "OK":
+                    stats.gzipped_count += 1
+                    stats.gzipped_size  += saved
+                elif status == "SKIP":
+                    stats.skipped_count += 1
+                else:
+                    stats.error_count   += 1
+            else:
+                try:
+                    if path.is_dir():
+                        shutil.rmtree(str(path))
+                    else:
+                        path.unlink()
+                    status = "OK"
+                    stats.deleted_count += 1
+                    stats.deleted_size  += max(_size, 0)
+                except Exception as exc:
+                    status = "ERROR: {}".format(exc)
+                    stats.error_count   += 1
+                    _log_error(error_fh, str(path), exc)  # type: ignore[arg-type]
+
+        status_color = status
+        if status == "OK":
+            status_color = _c("OK", "green")
+        elif status == "SKIP":
+            status_color = _c("SKIP (.gz exists)", "yellow")
+        elif status == "DRY-RUN":
+            status_color = _c("DRY-RUN", "dim")
+        elif status.startswith("ERROR"):
+            status_color = _c(status, "red")
+
+        print("  {}  {}  {}  {}".format(tag_term, row_term, action, status_color))
+        _write_fh(delete_fh, "{}  {}  {}".format(row_plain, action, status))
 
     _write_fh(delete_fh, SEP)
     if dry_run and not _interrupted:
-        hint = "  (Add --delete to actually remove the files above.)"
+        hint = "  (Add --delete to actually perform actions.)"
         print("\n" + hint)
         _write_fh(delete_fh, hint)
 
 
 # ===========================================================================
-#  CLI helpers
+#  Summary log
+# ===========================================================================
+def write_summary(rules, stats, dry_run, root_real, out_path):
+    # type: (List[Dict], Stats, bool, Path, str) -> None
+    if not out_path:
+        return
+
+    mode   = "DRY-RUN" if dry_run else "EXECUTED"
+    # Column widths for summary rule table
+    _SW_ID    = 6
+    _SW_TAG   = _TAG_W      # 12 -- same as trace log tag width
+    _SW_DESC  = 30
+    _SW_HITS  = 8
+    _SW_SIZE  = 12
+    _SW_PAT   = 36
+    _sum_sep  = "-" * (_SW_ID + _SW_TAG + _SW_DESC + _SW_HITS + _SW_SIZE + _SW_PAT + 14)
+
+    def _sum_hdr():
+        # type: () -> str
+        return "{:<{i}}  {:<{t}}  {:<{d}}  {:>{h}}  {:>{s}}  {}".format(
+            "ID", "LEVEL", "DESC", "HITS", "EST.SIZE", "PATTERN",
+            i=_SW_ID, t=_SW_TAG, d=_SW_DESC, h=_SW_HITS, s=_SW_SIZE)
+
+    def _sum_row(rid, tag, desc, hits, size, pattern):
+        # type: (str, str, str, int, int, str) -> str
+        return "{:<{i}}  {:<{t}}  {:<{d}}  {:>{h}}  {:>{s}}  {}".format(
+            rid, tag, desc[:_SW_DESC], hits, human_size(size), pattern,
+            i=_SW_ID, t=_SW_TAG, d=_SW_DESC, h=_SW_HITS, s=_SW_SIZE)
+
+    lines = [
+        "# IC Cleanup -- summary log",
+        "# Date  : {}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        "# Root  : {}".format(root_real),
+        "# Mode  : {}".format(mode),
+        "",
+        "=== Rule Hit Count ===",
+        _sum_hdr(),
+        _sum_sep,
+    ]
+
+    any_hit = False
+    for r in rules:
+        info = stats.rule_hits.get(r["id"], {"hits": 0, "size": 0})
+        if info["hits"] == 0:
+            continue
+        any_hit = True
+        # Use the same plain tag as trace log (based on internal level constant)
+        level_const = r["level"]   # e.g. SAFE, GZIP, PROTECTED, CURRENT
+        tag_str = _PLAIN.get(level_const, "[{:<10}]".format(level_const))
+        lines.append(_sum_row(
+            r["id"], tag_str.strip(), r["desc"],
+            info["hits"], info["size"], r["pattern"]))
+
+    # SVN implicit rule row
+    if stats.svn_count > 0:
+        any_hit = True
+        lines.append(_sum_row(
+            SVN_RULE_ID, _PLAIN_SVN.strip(), "SVN working copy",
+            stats.svn_count, stats.svn_size, ".svn (implicit)"))
+
+    if not any_hit:
+        lines.append("  (no rules matched)")
+    lines.append(_sum_sep)
+
+    total_hits = sum(v["hits"] for v in stats.rule_hits.values()) + stats.svn_count
+    total_size = sum(v["size"] for v in stats.rule_hits.values()) + stats.svn_size
+    lines.append(_sum_row("TOTAL", "", "", total_hits, total_size, ""))
+
+    lines += [
+        "",
+        "=== SVN Working Copy ===",
+        "  Detected : {:>6} dirs    {}  (not scanned inside)".format(
+            stats.svn_count, human_size(stats.svn_size)),
+        "",
+        "=== Action Summary ===",
+    ]
+
+    if dry_run:
+        lines.append("  (dry-run -- no actions performed)")
+    else:
+        lines += [
+            "  Deleted  : {:>6} items   {}".format(
+                stats.deleted_count, human_size(stats.deleted_size)),
+            "  Gzipped  : {:>6} items   {}".format(
+                stats.gzipped_count, human_size(stats.gzipped_size)),
+            "  Skipped  : {:>6} items   (gz already existed)".format(
+                stats.skipped_count),
+            "  Errors   : {:>6}".format(stats.error_count),
+        ]
+
+    try:
+        fh = open_log(out_path)
+        for line in lines:
+            _write_fh(fh, line)
+        fh.close()  # type: ignore
+    except OSError as exc:
+        print("ERROR: cannot write summary log {}: {}".format(out_path, exc),
+              file=sys.stderr)
+
+
+# ===========================================================================
+#  CLI
 # ===========================================================================
 def build_parser():
     # type: () -> argparse.ArgumentParser
@@ -750,50 +998,33 @@ def build_parser():
         epilog=__doc__,
     )
     p.add_argument("root", help="Root directory to scan")
-
     p.add_argument("--rules", metavar="FILE", default=None,
         dest="rules_file",
         help="JSON rule file (default: rules.json beside this script)")
-
     p.add_argument("--out-dir", metavar="DIR", default=None,
         dest="out_dir",
-        help="Write trace/delete/error/rule logs under DIR")
+        help="Write all logs (trace/delete/error/rule/summary) under DIR")
     p.add_argument("--gz", action="store_true", default=False,
         help="Compress all --out-dir logs with gzip (.log.gz)")
-
-    p.add_argument("--log-trace",  metavar="FILE", default=None, dest="log_trace",
-        help="Scan trace log  (overrides --out-dir; .gz = gzip)")
-    p.add_argument("--log-delete", metavar="FILE", default=None, dest="log_delete",
-        help="Delete action log (overrides --out-dir; .gz = gzip)")
-    p.add_argument("--log-error",  metavar="FILE", default=None, dest="log_error",
-        help="Filesystem error log (overrides --out-dir; .gz = gzip)")
-    p.add_argument("--log-rule",   metavar="FILE", default=None, dest="log_rule",
-        help="Rule table log (overrides --out-dir; .gz = gzip)")
-
     p.add_argument("--delete", action="store_true", default=False,
-        help="Actually delete Safe/Caution items (default: dry-run)")
+        help="Actually perform delete/gzip actions (default: dry-run)")
     p.add_argument("--level", metavar="LEVEL", nargs="+", default=None,
         choices=list(LEVEL_MAP.keys()),
-        help="Filter output: safe caution danger protected not_current")
+        help="Filter output: safe gzip protected not_current")
     return p
 
 
-def _resolve_log_paths(args):
-    # type: (argparse.Namespace) -> Tuple[str, str, str, str]
-    """Return (trace, delete, error, rule) as absolute path strings or ''."""
-    ext = ".gz" if args.gz else ""
+def _log_paths(out_dir, gz):
+    # type: (str, bool) -> Tuple[str, str, str, str, str, str]
+    """Return (trace, delete, error, rule, summary, svndir) paths under out_dir."""
+    ext = ".gz" if gz else ""
+    base = Path(out_dir).resolve()
 
-    def _from_dir(name):
+    def p(name):
         # type: (str) -> str
-        if args.out_dir:
-            return str(Path(args.out_dir).resolve() / (name + ".log" + ext))
-        return ""
+        return str(base / (name + ".log" + ext))
 
-    trace_p  = str(Path(args.log_trace ).resolve()) if args.log_trace  else _from_dir("trace")
-    delete_p = str(Path(args.log_delete).resolve()) if args.log_delete else _from_dir("delete")
-    error_p  = str(Path(args.log_error ).resolve()) if args.log_error  else _from_dir("error")
-    rule_p   = str(Path(args.log_rule  ).resolve()) if args.log_rule   else _from_dir("rule")
-    return trace_p, delete_p, error_p, rule_p
+    return p("trace"), p("delete"), p("error"), p("rule"), p("summary"), p("svndir")
 
 
 def _open_log_safe(path, label):
@@ -807,30 +1038,21 @@ def _open_log_safe(path, label):
         return None
 
 
-# ===========================================================================
-#  main
-# ===========================================================================
 def main():
     # type: () -> None
     _install_sigint_handler()
-
     args = build_parser().parse_args()
 
-    # --- locate rule file ---
-    if args.rules_file:
-        rules_path = args.rules_file
-    else:
-        rules_path = str(Path(__file__).resolve().parent / "rules.json")
-
+    # --- rules ---
+    rules_path = args.rules_file or str(
+        Path(__file__).resolve().parent / "rules.json")
     if not os.path.exists(rules_path):
         print("ERROR: rule file not found: {}".format(rules_path), file=sys.stderr)
         sys.exit(1)
 
-    # --- load + compile rules ---
     global RULES
     RULES = load_rules(rules_path)
-    print("Loaded {} rules from {}".format(
-        len(RULES), _c(rules_path, "cyan")))
+    print("Loaded {} rules from {}".format(len(RULES), _c(rules_path, "cyan")))
 
     # --- scan root ---
     root = Path(args.root).resolve()
@@ -838,13 +1060,17 @@ def main():
         print("ERROR: directory not found: {}".format(root), file=sys.stderr)
         sys.exit(1)
 
-    # --- create out-dir ---
+    # --- out-dir ---
     if args.out_dir:
         try:
             Path(args.out_dir).mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             print("ERROR: cannot create out-dir: {}".format(exc), file=sys.stderr)
             sys.exit(1)
+        trace_p, delete_p, error_p, rule_p, summary_p, svn_p = _log_paths(
+            args.out_dir, args.gz)
+    else:
+        trace_p = delete_p = error_p = rule_p = summary_p = svn_p = ""
 
     level_filter = None  # type: Optional[Set[str]]
     if args.level:
@@ -853,20 +1079,21 @@ def main():
     root_real = Path(os.path.realpath(str(root)))
     print("Scanning: {}\n".format(_c(str(root_real), "bold")))
 
-    trace_p, delete_p, error_p, rule_p = _resolve_log_paths(args)
+    # --- stats ---
+    stats = Stats(RULES)
 
-    scan_fh   = _open_log_safe(trace_p,  "--log-trace")
-    error_fh  = _open_log_safe(error_p,  "--log-error")
-    delete_fh = _open_log_safe(delete_p, "--log-delete")
-    rule_fh   = _open_log_safe(rule_p,   "--log-rule")
+    # --- open logs ---
+    scan_fh   = _open_log_safe(trace_p,  "trace log")
+    error_fh  = _open_log_safe(error_p,  "error log")
+    delete_fh = _open_log_safe(delete_p, "delete log")
+    rule_fh   = _open_log_safe(rule_p,   "rule log")
+    svn_fh    = _open_log_safe(svn_p,    "svndir log")
 
-    # --- write rule log ---
     write_rule_log(RULES, rule_fh)
     if rule_fh:
-        rule_fh.close()   # type: ignore
-        print("Rule log        : {}".format(_c(rule_p, "cyan")))
+        rule_fh.close()  # type: ignore
+        print("Rule log   : {}".format(_c(rule_p, "cyan")))
 
-    # --- write scan log header ---
     if scan_fh:
         _write_fh(scan_fh, "# IC Cleanup -- scan trace log")
         _write_fh(scan_fh, "# Root  : {}".format(root_real))
@@ -882,33 +1109,51 @@ def main():
         _write_fh(error_fh, "# Date  : {}\n".format(
             datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
 
+    if svn_fh:
+        _write_fh(svn_fh, "# IC Cleanup -- SVN working copy directory log")
+        _write_fh(svn_fh, "# Root  : {}".format(root_real))
+        _write_fh(svn_fh, "# Date  : {}\n".format(
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        _write_fh(svn_fh, HEADER_PLAIN)
+        _write_fh(svn_fh, SEP)
+
     try:
         results = scan_and_print(root, level_filter,
-                                 scan_fh, error_fh,
-                                 trace_p, error_p)
+                                 scan_fh, error_fh, svn_fh,
+                                 trace_p, error_p, svn_p, stats)
     finally:
         if scan_fh:
-            scan_fh.close()   # type: ignore
-            print("\nScan trace log  : {}".format(_c(trace_p, "cyan")))
+            scan_fh.close()  # type: ignore
+            print("\nTrace log  : {}".format(_c(trace_p, "cyan")))
         if error_fh:
             error_fh.close()  # type: ignore
-            print("Error log       : {}".format(_c(error_p, "cyan")))
+            print("Error log  : {}".format(_c(error_p, "cyan")))
+        if svn_fh:
+            svn_fh.close()  # type: ignore
+            print("SVNdir log : {}".format(_c(svn_p, "cyan")))
 
     if not results:
         print("\nNo matching files found.")
         if delete_fh:
             delete_fh.close()  # type: ignore
+        write_summary(RULES, stats, not args.delete, root_real, summary_p)
+        if summary_p:
+            print("Summary    : {}".format(_c(summary_p, "cyan")))
         return
 
     print()
     try:
-        do_delete(results, dry_run=not args.delete,
-                  delete_fh=delete_fh, error_fh=error_fh,
-                  delete_path=delete_p)
+        do_actions(results, dry_run=not args.delete,
+                   delete_fh=delete_fh, error_fh=error_fh,
+                   delete_path=delete_p, stats=stats)
     finally:
         if delete_fh:
             delete_fh.close()  # type: ignore
-            print("\nDelete log      : {}".format(_c(delete_p, "cyan")))
+            print("\nDelete log : {}".format(_c(delete_p, "cyan")))
+
+    write_summary(RULES, stats, not args.delete, root_real, summary_p)
+    if summary_p:
+        print("Summary    : {}".format(_c(summary_p, "cyan")))
 
     if _interrupted:
         sys.exit(130)
