@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HEX → 7Z Restore</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Barlow+Condensed:wght@400;600;800&display=swap');
+
+  :root {
+    --bg:      #0d0f0d;
+    --surface: #141814;
+    --border:  #1f2a1f;
+    --accent:  #6fcf4a;
+    --amber:   #f0a500;
+    --red:     #f05a3a;
+    --text:    #c8dcc0;
+    --dim:     #4a604a;
+    --glow:    0 0 24px rgba(111,207,74,0.25);
+  }
+
+  * { margin:0; padding:0; box-sizing:border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'IBM Plex Mono', monospace;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* Scanline overlay */
+  body::after {
+    content:'';
+    position:fixed; inset:0;
+    background: repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(0,0,0,0.07) 2px,
+      rgba(0,0,0,0.07) 4px
+    );
+    pointer-events:none;
+    z-index:999;
+  }
+
+  /* Noise texture */
+  body::before {
+    content:'';
+    position:fixed; inset:0;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");
+    pointer-events:none; z-index:0;
+    opacity: 0.4;
+  }
+
+  .wrap {
+    position:relative; z-index:1;
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 44px 24px 72px;
+  }
+
+  /* ── Header ── */
+  header { margin-bottom: 52px; }
+
+  .eyebrow {
+    font-family: 'Barlow Condensed', sans-serif;
+    font-size: 11px;
+    letter-spacing: 5px;
+    color: var(--accent);
+    opacity: 0.6;
+    text-transform: uppercase;
+    margin-bottom: 6px;
+  }
+
+  h1 {
+    font-family: 'Barlow Condensed', sans-serif;
+    font-weight: 800;
+    font-size: clamp(44px, 7vw, 72px);
+    line-height: 0.92;
+    letter-spacing: -1px;
+    color: #fff;
+  }
+
+  h1 em {
+    font-style: normal;
+    color: var(--accent);
+    text-shadow: var(--glow);
+  }
+
+  .tagline {
+    margin-top: 12px;
+    font-size: 12px;
+    color: var(--dim);
+    letter-spacing: 1px;
+    line-height: 1.7;
+  }
+
+  .tagline code {
+    background: rgba(111,207,74,0.08);
+    color: var(--accent);
+    padding: 1px 5px;
+    border-radius: 2px;
+    font-size: 11px;
+  }
+
+  .rule {
+    margin-top: 18px;
+    height: 1px;
+    background: linear-gradient(90deg, var(--accent) 0%, transparent 60%);
+    opacity: 0.3;
+  }
+
+  /* ── Sections ── */
+  .block { margin-bottom: 30px; }
+
+  .blabel {
+    font-family: 'Barlow Condensed', sans-serif;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 4px;
+    color: var(--accent);
+    text-transform: uppercase;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 10px;
+  }
+
+  .blabel .num {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px; height: 20px;
+    border: 1px solid var(--accent);
+    border-radius: 2px;
+    font-size: 10px;
+    opacity: 0.6;
+  }
+
+  .blabel::after {
+    content:''; flex:1; height:1px;
+    background: var(--border);
+  }
+
+  /* ── Textarea ── */
+  textarea {
+    width: 100%;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 12.5px;
+    line-height: 1.75;
+    padding: 14px 16px;
+    border-radius: 3px;
+    resize: vertical;
+    min-height: 200px;
+    outline: none;
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+
+  textarea:focus {
+    border-color: var(--accent);
+    box-shadow: var(--glow), inset 0 0 40px rgba(111,207,74,0.02);
+  }
+
+  textarea::placeholder { color: var(--dim); }
+
+  /* ── Stats ── */
+  .stats {
+    display: flex; flex-wrap: wrap;
+    gap: 18px;
+    margin-top: 7px;
+    font-size: 10px;
+    letter-spacing: 1.5px;
+    color: var(--dim);
+  }
+
+  .stat span { color: var(--accent); }
+
+  /* ── Format badge ── */
+  .fmt-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    margin-top: 12px;
+    padding: 5px 12px;
+    font-family: 'Barlow Condensed', sans-serif;
+    font-weight: 600;
+    font-size: 11px;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    border-radius: 2px;
+    opacity: 0;
+    transition: opacity 0.3s;
+  }
+
+  .fmt-badge.show { opacity: 1; }
+  .fmt-badge.ok  { background: rgba(111,207,74,0.08); border:1px solid rgba(111,207,74,0.25); color: var(--accent); }
+  .fmt-badge.bad { background: rgba(240,90,58,0.08);  border:1px solid rgba(240,90,58,0.25);  color: var(--red); }
+
+  .blink-dot {
+    width:6px; height:6px; border-radius:50%;
+    animation: bdot 1.4s infinite;
+  }
+  .ok  .blink-dot { background: var(--accent); }
+  .bad .blink-dot { background: var(--red); }
+
+  @keyframes bdot { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.3;transform:scale(.6)} }
+
+  /* ── Input row ── */
+  .field-row {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    margin-bottom: 16px;
+  }
+
+  .field-row label {
+    font-size: 10px;
+    letter-spacing: 2px;
+    color: var(--dim);
+    white-space: nowrap;
+    text-transform: uppercase;
+    min-width: 80px;
+  }
+
+  input[type=text], input[type=password] {
+    flex: 1;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 13px;
+    padding: 9px 13px;
+    border-radius: 3px;
+    outline: none;
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+
+  input[type=text]:focus, input[type=password]:focus {
+    border-color: var(--accent);
+    box-shadow: var(--glow);
+  }
+
+  .pw-wrap {
+    position: relative;
+    flex: 1;
+    display: flex;
+    align-items: center;
+  }
+
+  .pw-wrap input { width:100%; padding-right:44px; }
+
+  .pw-toggle {
+    position: absolute;
+    right: 10px;
+    background: none;
+    border: none;
+    color: var(--dim);
+    cursor: pointer;
+    font-size: 13px;
+    padding: 0 4px;
+    line-height: 1;
+    transition: color 0.2s;
+  }
+  .pw-toggle:hover { color: var(--accent); }
+
+  /* ── Buttons ── */
+  .btn-row { display:flex; gap:10px; flex-wrap:wrap; }
+
+  button.btn {
+    cursor: pointer;
+    font-family: 'Barlow Condensed', sans-serif;
+    font-weight: 600;
+    font-size: 14px;
+    letter-spacing: 2.5px;
+    text-transform: uppercase;
+    padding: 11px 26px;
+    border-radius: 2px;
+    border: none;
+    transition: all 0.18s;
+  }
+
+  button.btn:active { transform: scale(0.97); }
+
+  .btn-go {
+    background: var(--accent);
+    color: #000;
+    box-shadow: var(--glow);
+  }
+  .btn-go:hover { box-shadow: 0 0 36px rgba(111,207,74,0.5); }
+  .btn-go:disabled { opacity:0.4; cursor:not-allowed; box-shadow:none; }
+
+  .btn-preview {
+    background: transparent;
+    color: var(--dim);
+    border: 1px solid var(--border);
+  }
+  .btn-preview:hover { border-color:var(--accent); color:var(--accent); }
+
+  .btn-clear {
+    background: transparent;
+    color: var(--dim);
+    border: 1px solid var(--border);
+  }
+  .btn-clear:hover { border-color:var(--red); color:var(--red); }
+
+  /* ── Status ── */
+  .status {
+    margin-top: 18px;
+    padding: 13px 16px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    font-size: 12px;
+    line-height: 1.85;
+    display: none;
+  }
+  .status.show { display:block; }
+  .status.ok  { border-left:3px solid var(--accent); color:var(--accent); }
+  .status.err { border-left:3px solid var(--red);    color:var(--red); }
+  .status.inf { border-left:3px solid var(--amber);  color:var(--text); }
+
+  /* ── Preview panel ── */
+  .preview {
+    margin-top: 14px;
+    padding: 14px 16px;
+    background: rgba(111,207,74,0.02);
+    border: 1px solid rgba(111,207,74,0.08);
+    border-radius: 3px;
+    font-size: 11px;
+    color: var(--dim);
+    display: none;
+    line-height: 1.9;
+  }
+  .preview.show { display:block; }
+
+  .hex-row { display:flex; gap:14px; padding:1px 0; }
+  .ho { color:var(--accent); opacity:.45; min-width:48px; }
+  .hb { color:var(--text); opacity:.55; }
+  .ha { color:#6fcf4a; opacity:.4; }
+
+  .ptable {
+    margin-top:10px;
+    display:grid;
+    grid-template-columns: max-content 1fr;
+    gap:3px 16px;
+    font-size:11px;
+  }
+  .pk { color:var(--dim); }
+  .pv { color:var(--text); }
+  .pv.hi { color:var(--accent); }
+  .pv.warn { color:var(--amber); }
+
+  /* ── Note ── */
+  .note {
+    margin-top:44px;
+    padding:16px 18px;
+    border:1px solid rgba(240,165,0,0.15);
+    background:rgba(240,165,0,0.03);
+    border-radius:3px;
+    font-size:11px;
+    color:var(--dim);
+    line-height:1.95;
+  }
+  .note strong { color:var(--amber); }
+
+  @keyframes fadein { from{opacity:0;transform:translateY(5px)} to{opacity:1;transform:none} }
+  .wrap > * { animation:fadein .35s ease both; }
+  header { animation-delay:.02s; }
+  .block:nth-of-type(1){ animation-delay:.06s; }
+  .block:nth-of-type(2){ animation-delay:.10s; }
+  .block:nth-of-type(3){ animation-delay:.14s; }
+  .block:nth-of-type(4){ animation-delay:.18s; }
+  .note  { animation-delay:.22s; }
+
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+  .cur { animation:blink 1s infinite; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="eyebrow">// offline restore utility v1.0</div>
+    <h1>HEX<br>→ <em>7Z</em></h1>
+    <p class="tagline">
+      還原 <code>7zdump.sh</code> 產生的加密壓縮 hexdump<br>
+      輸入密碼後下載 .7z，用 7-Zip 解壓即可
+    </p>
+    <div class="rule"></div>
+  </header>
+
+  <!-- 01 hex input -->
+  <div class="block">
+    <div class="blabel"><span class="num">01</span>hex dump 輸入</div>
+    <textarea id="hexIn"
+      placeholder="貼上 7zdump.sh 輸出的 hexdump 內容&#10;&#10;格式說明：&#10;  每行開頭有一個空格&#10;  每 32 行之間有一行空行&#10;  首行與末行為空行&#10;&#10;7z magic bytes 開頭（第二行）：377abcaf271c..."
+      spellcheck="false"
+      oninput="onHexInput()"
+    ></textarea>
+    <div class="stats">
+      <div class="stat">LINES <span id="sLines">0</span></div>
+      <div class="stat">HEX CHARS <span id="sChars">0</span></div>
+      <div class="stat">BYTES <span id="sBytes">0</span></div>
+      <div class="stat">FORMAT <span id="sFmt">—</span></div>
+    </div>
+    <div class="fmt-badge" id="fmtBadge">
+      <div class="blink-dot"></div>
+      <span id="fmtText"></span>
+    </div>
+  </div>
+
+  <!-- 02 password + filename -->
+  <div class="block">
+    <div class="blabel"><span class="num">02</span>密碼 &amp; 輸出檔名</div>
+    <div class="field-row">
+      <label>Password</label>
+      <div class="pw-wrap">
+        <input type="password" id="pwInput" placeholder="輸入解壓密碼（給 7-Zip 用，前端不解密）" autocomplete="off">
+        <button class="pw-toggle" onclick="togglePw()" title="顯示/隱藏">&#128065;</button>
+      </div>
+    </div>
+    <div class="field-row">
+      <label>Filename</label>
+      <input type="text" id="fnInput" value="output.7z" spellcheck="false">
+    </div>
+  </div>
+
+  <!-- 03 actions -->
+  <div class="block">
+    <div class="blabel"><span class="num">03</span>執行</div>
+    <div class="btn-row">
+      <button class="btn btn-go"      onclick="doConvert()">&#9654; RESTORE &amp; DOWNLOAD</button>
+      <button class="btn btn-preview" onclick="doPreview()">&#9672; PREVIEW HEADER</button>
+      <button class="btn btn-clear"   onclick="doClear()">&#10005; CLEAR</button>
+    </div>
+    <div class="status" id="statusEl"></div>
+    <div class="preview" id="previewEl"></div>
+  </div>
+
+  <!-- note -->
+  <div class="note">
+    <strong>完整工作流程</strong><br><br>
+    【Linux 端】<br>
+    &nbsp;&nbsp;<code style="color:#c8dcc0">./7zdump.sh &lt;file&gt; -enc &lt;password&gt;</code><br>
+    &nbsp;&nbsp;產生 <code style="color:#6fcf4a">&lt;file&gt;.7z.hex</code>，將此文字檔傳輸至 Windows<br><br>
+    【Windows 端（本頁）】<br>
+    &nbsp;&nbsp;① 貼入 hex 內容 → ② 輸入密碼 → ③ RESTORE &amp; DOWNLOAD<br>
+    &nbsp;&nbsp;④ 7-Zip 右鍵 → <em>Extract here</em>，輸入密碼解壓<br><br>
+    <strong>注意：</strong>本頁不執行任何解密，密碼欄位僅協助你記住密碼並顯示於說明。<br>
+    所有操作完全在瀏覽器端，不需網路，不上傳任何資料<span class="cur">_</span>
+  </div>
+
+</div>
+<script>
+// ── hex utils ────────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+
+function rawHex() {
+  // Format: blank lines = section separators; each data line has 1 leading space.
+  // Strip blank lines, peel off the single leading space, then collapse whitespace.
+  return $('hexIn').value
+    .split('\n')
+    .filter(l => l.trim() !== '')
+    .map(l => l.startsWith(' ') ? l.slice(1) : l)
+    .join('')
+    .replace(/\s+/g, '')
+    .toLowerCase();
+}
+
+function hexToBytes(hex) {
+  if (hex.length % 2 !== 0)
+    throw new Error('Hex 長度必須為偶數（目前：' + hex.length + '）');
+  const b = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < b.length; i++) {
+    const v = parseInt(hex.slice(i*2, i*2+2), 16);
+    if (isNaN(v)) throw new Error('非法 hex 字元於位置 ' + i*2 + '：「' + hex.slice(i*2,i*2+2) + '」');
+    b[i] = v;
+  }
+  return b;
+}
+
+function peekBytes(hex, n) {
+  const b = new Uint8Array(Math.min(Math.floor(hex.length/2), n));
+  for (let i=0; i<b.length; i++) b[i] = parseInt(hex.slice(i*2,i*2+2),16)||0;
+  return b;
+}
+
+// ── format detection ─────────────────────────────────────────────────
+// 7z signature: 37 7a bc af 27 1c
+const SIG_7Z  = [0x37,0x7a,0xbc,0xaf,0x27,0x1c];
+const SIG_GZ  = [0x1f,0x8b];
+const SIG_ZIP = [0x50,0x4b];
+
+function detect(bytes) {
+  if (bytes.length < 2) return 'unknown';
+  if (SIG_7Z.every((v,i) => bytes[i]===v))  return '7z';
+  if (SIG_GZ.every((v,i) => bytes[i]===v))  return 'gz';
+  if (SIG_ZIP.every((v,i) => bytes[i]===v)) return 'zip';
+  if (bytes[0] & 0x80) {
+    const tag = (bytes[0] & 0x40) ? (bytes[0]&0x3f) : ((bytes[0]&0x3c)>>2);
+    if (tag>=1 && tag<=20) return 'gpg';
+  }
+  return 'unknown';
+}
+
+// ── 7z header parser ─────────────────────────────────────────────────
+// Ref: 7z file format spec (7zFormat.txt)
+// Signature + header:
+//   Signature[6] + MajorVersion[1] + MinorVersion[1]
+//   + StartHeaderCRC[4] + NextHeaderOffset[8] + NextHeaderSize[8] + NextHeaderCRC[4]
+function parse7zHeader(bytes) {
+  if (bytes.length < 32) return null;
+  const major = bytes[6], minor = bytes[7];
+  const crc = (bytes[8]|(bytes[9]<<8)|(bytes[10]<<16)|(bytes[11]<<24))>>>0;
+
+  // NextHeaderOffset is little-endian 64-bit; read lower 32 bits (sufficient for practical sizes)
+  const offsetLo = (bytes[12]|(bytes[13]<<8)|(bytes[14]<<16)|(bytes[15]<<24))>>>0;
+  const sizeLo   = (bytes[20]|(bytes[21]<<8)|(bytes[22]<<16)|(bytes[23]<<24))>>>0;
+  const headerCrc= (bytes[24]|(bytes[25]<<8)|(bytes[26]<<16)|(bytes[27]<<24))>>>0;
+
+  return { major, minor, crc, offsetLo, sizeLo, headerCrc };
+}
+
+// ── UI helpers ───────────────────────────────────────────────────────
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function setStatus(html, type) {
+  const el = $('statusEl');
+  el.className = 'status show ' + (type||'inf');
+  el.innerHTML = html;
+}
+
+function togglePw() {
+  const el = $('pwInput');
+  el.type = el.type === 'password' ? 'text' : 'password';
+}
+
+let _lastFmt = '';
+
+function onHexInput() {
+  const hex = rawHex();
+  const raw = $('hexIn').value;
+  const totalLines = raw.trim() ? raw.trim().split('\n').length : 0;
+  const dataLines  = raw.trim() ? raw.trim().split('\n').filter(l => l.trim() !== '').length : 0;
+  $('sLines').textContent = dataLines + ' (total ' + totalLines + ')';
+  $('sChars').textContent = hex.length;
+  $('sBytes').textContent = Math.floor(hex.length/2);
+
+  let fmt = 'unknown';
+  if (hex.length >= 12) fmt = detect(peekBytes(hex, 12));
+
+  const fmtLabels = { '7z':'7Z', gz:'GZIP', zip:'ZIP', gpg:'GPG', unknown:'?' };
+  $('sFmt').textContent = fmtLabels[fmt] || '—';
+
+  const badge = $('fmtBadge');
+  const is7z  = fmt === '7z';
+  if (hex.length >= 12) {
+    badge.className = 'fmt-badge show ' + (is7z ? 'ok' : 'bad');
+    $('fmtText').textContent = is7z
+      ? '7Z 格式確認'
+      : '格式不符（偵測到：' + (fmtLabels[fmt]||'UNKNOWN') + '）';
+  } else {
+    badge.className = 'fmt-badge';
+  }
+
+  // auto filename
+  if (fmt !== _lastFmt && hex.length >= 12) {
+    _lastFmt = fmt;
+    if (is7z && !$('fnInput').value.endsWith('.7z'))
+      $('fnInput').value = $('fnInput').value.replace(/\.[^.]+$/, '') + '.7z';
+  }
+}
+
+function doConvert() {
+  try {
+    const hex = rawHex();
+    if (!hex) { setStatus('&#9888; 請先貼入 hexdump 內容', 'err'); return; }
+    setStatus('&#8635; 解析中…', 'inf');
+
+    const bytes = hexToBytes(hex);
+    const fmt   = detect(bytes);
+    if (fmt !== '7z') {
+      throw new Error(
+        '非 7z 格式（偵測：' + fmt.toUpperCase() + '）\n' +
+        '開頭 bytes：' + Array.from(bytes.slice(0,6)).map(b=>b.toString(16).padStart(2,'0')).join(' ') + '\n' +
+        '7z 應為：37 7a bc af 27 1c'
+      );
+    }
+
+    const filename = $('fnInput').value.trim() || 'output.7z';
+    const password = $('pwInput').value;
+    const blob = new Blob([bytes], { type:'application/x-7z-compressed' });
+    const url  = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href=url; a.download=filename;
+    document.body.appendChild(a); a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 8000);
+
+    const h = parse7zHeader(bytes);
+    const kb = (bytes.length/1024).toFixed(2);
+    setStatus(
+      '&#10003; 成功下載 <strong>' + esc(filename) + '</strong><br>' +
+      '&nbsp;&nbsp;大小：' + bytes.length + ' bytes (' + kb + ' KB)' +
+      (h ? '&nbsp;&nbsp;|&nbsp;&nbsp;7z v' + h.major + '.' + h.minor : '') +
+      (password ? '<br>&nbsp;&nbsp;密碼：<code style="background:rgba(111,207,74,.1);padding:1px 6px">' + esc(password) + '</code>（請用 7-Zip 解壓時輸入）' : ''),
+      'ok'
+    );
+    $('previewEl').className = 'preview';
+  } catch(e) {
+    setStatus('&#10007; ' + esc(e.message.replace(/\n/g,'<br>&nbsp;&nbsp;')), 'err');
+  }
+}
+
+function doPreview() {
+  try {
+    const hex = rawHex();
+    if (!hex) { setStatus('&#9888; 請先貼入 hexdump 內容', 'err'); return; }
+
+    const bytes = hexToBytes(hex);
+    const fmt   = detect(bytes);
+    const preview = bytes.slice(0, 128);
+    const panel = $('previewEl');
+
+    let html = '<div style="font-size:10px;letter-spacing:2px;color:var(--accent);margin-bottom:8px">HEADER PREVIEW · first 128 bytes</div>';
+
+    // hex dump rows
+    for (let r=0; r<preview.length; r+=16) {
+      const chunk = preview.slice(r, r+16);
+      const hx = Array.from(chunk).map(b=>b.toString(16).padStart(2,'0')).join(' ');
+      const ac = Array.from(chunk).map(b=>(b>=0x20&&b<0x7f)?String.fromCharCode(b):'·').join('');
+      html += '<div class="hex-row">'
+        + '<span class="ho">'+r.toString(16).padStart(4,'0')+'</span>'
+        + '<span class="hb">'+hx.padEnd(47)+'</span>'
+        + '<span class="ha"> '+esc(ac)+'</span>'
+        + '</div>';
+    }
+
+    html += '<div class="ptable" style="margin-top:14px">';
+
+    if (fmt === '7z') {
+      const h = parse7zHeader(bytes);
+      const sigHex = Array.from(bytes.slice(0,6)).map(b=>b.toString(16).padStart(2,'0')).join(' ');
+      const rows = [
+        ['Signature',    '<span class="pv hi">'+sigHex+' &#10003; 7z</span>'],
+        ['Version',      h ? h.major+'.'+h.minor : '—'],
+        ['Header CRC32', h ? '0x'+h.crc.toString(16).padStart(8,'0') : '—'],
+        ['Next Header Offset', h ? h.offsetLo+' bytes' : '—'],
+        ['Next Header Size',   h ? h.sizeLo+' bytes' : '—'],
+        ['Next Header CRC32',  h ? '0x'+h.headerCrc.toString(16).padStart(8,'0') : '—'],
+        ['Total file size',    bytes.length+' bytes'],
+        ['Note', '<span class="pv warn">Header encrypted (-mhe=on): 7-Zip 需要密碼才能列出內容</span>'],
+      ];
+      for (const [k,v] of rows)
+        html += '<span class="pk">'+esc(k)+'</span><span class="pv">'+v+'</span>';
+    } else {
+      html += '<span style="color:var(--red)">格式不符，期望 7z（37 7a bc af 27 1c），'
+        + '偵測到：' + fmt.toUpperCase() + '</span>';
+    }
+
+    html += '</div>';
+    panel.innerHTML = html;
+    panel.className = 'preview show';
+    setStatus(fmt==='7z'
+      ? '&#9672; Header 解析完成，7z 格式確認 &#10003;'
+      : '&#9888; 非 7z 格式', fmt==='7z'?'ok':'err');
+  } catch(e) {
+    setStatus('&#10007; '+esc(e.message.replace(/\n/g,'<br>&nbsp;&nbsp;')),'err');
+  }
+}
+
+function doClear() {
+  $('hexIn').value = '';
+  $('fnInput').value = 'output.7z';
+  $('pwInput').value = '';
+  $('statusEl').className = 'status';
+  $('previewEl').className = 'preview';
+  $('fmtBadge').className = 'fmt-badge';
+  _lastFmt = '';
+  onHexInput();
+}
+</script>
+</body>
+</html>
