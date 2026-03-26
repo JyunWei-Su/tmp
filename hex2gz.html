@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HEX → GZ Converter</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@300;500;700&display=swap');
+
+  :root {
+    --bg: #0a0c0f;
+    --panel: #0f1318;
+    --border: #1e2a38;
+    --accent: #00e5ff;
+    --accent2: #00ff9d;
+    --warn: #ff6b35;
+    --text: #c8d8e8;
+    --dim: #4a6070;
+    --glow: 0 0 20px rgba(0,229,255,0.3);
+    --glow2: 0 0 20px rgba(0,255,157,0.3);
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Share Tech Mono', monospace;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* Grid background */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image:
+      linear-gradient(rgba(0,229,255,0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,229,255,0.03) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .container {
+    position: relative;
+    z-index: 1;
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 40px 24px 60px;
+  }
+
+  /* Header */
+  header {
+    margin-bottom: 48px;
+    position: relative;
+  }
+
+  .header-tag {
+    font-size: 11px;
+    letter-spacing: 4px;
+    color: var(--accent);
+    opacity: 0.7;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+  }
+
+  h1 {
+    font-family: 'Rajdhani', sans-serif;
+    font-weight: 700;
+    font-size: clamp(36px, 6vw, 56px);
+    letter-spacing: 2px;
+    line-height: 1;
+    color: #fff;
+  }
+
+  h1 span {
+    color: var(--accent);
+    text-shadow: var(--glow);
+  }
+
+  .subtitle {
+    margin-top: 10px;
+    font-size: 13px;
+    color: var(--dim);
+    letter-spacing: 1px;
+  }
+
+  .subtitle code {
+    color: var(--accent2);
+    font-size: 11px;
+    background: rgba(0,255,157,0.07);
+    padding: 2px 6px;
+    border-radius: 3px;
+  }
+
+  /* Decorative line */
+  .divider {
+    height: 1px;
+    background: linear-gradient(90deg, var(--accent), transparent);
+    margin: 20px 0 0;
+    opacity: 0.4;
+  }
+
+  /* Section */
+  .section {
+    margin-bottom: 28px;
+  }
+
+  .section-label {
+    font-size: 10px;
+    letter-spacing: 3px;
+    color: var(--accent);
+    text-transform: uppercase;
+    margin-bottom: 10px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .section-label::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: var(--border);
+  }
+
+  /* Textarea */
+  textarea {
+    width: 100%;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 13px;
+    line-height: 1.7;
+    padding: 16px;
+    border-radius: 4px;
+    resize: vertical;
+    min-height: 220px;
+    outline: none;
+    transition: border-color 0.2s, box-shadow 0.2s;
+    letter-spacing: 0.5px;
+  }
+
+  textarea:focus {
+    border-color: var(--accent);
+    box-shadow: var(--glow), inset 0 0 30px rgba(0,229,255,0.02);
+  }
+
+  textarea::placeholder { color: var(--dim); }
+
+  /* Stats bar */
+  .stats-bar {
+    display: flex;
+    gap: 20px;
+    margin-top: 8px;
+    font-size: 11px;
+    color: var(--dim);
+    letter-spacing: 1px;
+  }
+
+  .stat-item { display: flex; align-items: center; gap: 6px; }
+  .stat-value { color: var(--accent2); }
+
+  /* Filename input */
+  .filename-row {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    margin-bottom: 20px;
+  }
+
+  .filename-row label {
+    font-size: 11px;
+    letter-spacing: 2px;
+    color: var(--dim);
+    white-space: nowrap;
+    text-transform: uppercase;
+  }
+
+  input[type="text"] {
+    flex: 1;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 13px;
+    padding: 10px 14px;
+    border-radius: 4px;
+    outline: none;
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+
+  input[type="text"]:focus {
+    border-color: var(--accent);
+    box-shadow: var(--glow);
+  }
+
+  /* Buttons */
+  .btn-row {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  button {
+    cursor: pointer;
+    font-family: 'Rajdhani', sans-serif;
+    font-weight: 700;
+    font-size: 14px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    padding: 12px 28px;
+    border-radius: 3px;
+    border: none;
+    transition: all 0.2s;
+    position: relative;
+    overflow: hidden;
+  }
+
+  button::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: rgba(255,255,255,0.05);
+    opacity: 0;
+    transition: opacity 0.2s;
+  }
+
+  button:hover::after { opacity: 1; }
+  button:active { transform: scale(0.98); }
+
+  .btn-primary {
+    background: var(--accent);
+    color: #000;
+    box-shadow: var(--glow);
+  }
+
+  .btn-primary:hover { box-shadow: 0 0 30px rgba(0,229,255,0.5); }
+
+  .btn-secondary {
+    background: transparent;
+    color: var(--dim);
+    border: 1px solid var(--border);
+  }
+
+  .btn-secondary:hover { border-color: var(--dim); color: var(--text); }
+
+  .btn-download {
+    background: var(--accent2);
+    color: #000;
+    box-shadow: var(--glow2);
+    display: none;
+  }
+
+  .btn-download:hover { box-shadow: 0 0 30px rgba(0,255,157,0.5); }
+  .btn-download.visible { display: inline-block; }
+
+  /* Progress / status */
+  .status-panel {
+    margin-top: 20px;
+    padding: 14px 16px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-size: 12px;
+    line-height: 1.8;
+    display: none;
+    min-height: 56px;
+  }
+
+  .status-panel.visible { display: block; }
+
+  .status-ok {
+    border-left: 3px solid var(--accent2);
+    color: var(--accent2);
+  }
+
+  .status-err {
+    border-left: 3px solid var(--warn);
+    color: var(--warn);
+  }
+
+  .status-info {
+    border-left: 3px solid var(--accent);
+    color: var(--text);
+  }
+
+  /* Preview box */
+  .preview-panel {
+    margin-top: 16px;
+    padding: 14px 16px;
+    background: rgba(0,229,255,0.03);
+    border: 1px solid rgba(0,229,255,0.1);
+    border-radius: 4px;
+    font-size: 11px;
+    color: var(--dim);
+    display: none;
+    word-break: break-all;
+    line-height: 1.9;
+  }
+
+  .preview-panel.visible { display: block; }
+
+  .preview-panel .hex-row {
+    display: flex;
+    gap: 12px;
+    padding: 2px 0;
+  }
+
+  .preview-panel .hex-offset {
+    color: var(--accent);
+    opacity: 0.5;
+    min-width: 50px;
+  }
+
+  .preview-panel .hex-bytes { color: var(--text); opacity: 0.6; }
+  .preview-panel .hex-ascii { color: var(--accent2); opacity: 0.5; }
+
+  /* Info note */
+  .info-note {
+    margin-top: 40px;
+    padding: 16px 20px;
+    background: rgba(255,107,53,0.04);
+    border: 1px solid rgba(255,107,53,0.15);
+    border-radius: 4px;
+    font-size: 11px;
+    color: var(--dim);
+    letter-spacing: 0.5px;
+    line-height: 1.9;
+  }
+
+  .info-note strong { color: var(--warn); }
+
+  /* Corner decorations */
+  .corner-deco {
+    position: absolute;
+    right: 0;
+    top: 0;
+    width: 60px;
+    height: 60px;
+    border-top: 1px solid var(--accent);
+    border-right: 1px solid var(--accent);
+    opacity: 0.2;
+  }
+
+  @keyframes blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0; }
+  }
+
+  .cursor { animation: blink 1s infinite; }
+
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .container > * { animation: fadeIn 0.4s ease both; }
+  .section:nth-child(1) { animation-delay: 0.05s; }
+  .section:nth-child(2) { animation-delay: 0.1s; }
+  .section:nth-child(3) { animation-delay: 0.15s; }
+  .section:nth-child(4) { animation-delay: 0.2s; }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <div class="corner-deco"></div>
+    <div class="header-tag">// offline utility v1.0</div>
+    <h1>HEX <span>→</span> GZ</h1>
+    <p class="subtitle">
+      將 <code>hexdump -v -e '64/1 "%02x"' -e '"\n"'</code> 輸出還原為 .gz 檔案
+    </p>
+    <div class="divider"></div>
+  </header>
+
+  <div class="section">
+    <div class="section-label">01 &mdash; hex dump 輸入</div>
+    <textarea id="hexInput"
+      placeholder="貼上 hexdump 輸出內容&#10;&#10;範例：&#10;1f8b0800000000000903...&#10;a3b2c1d0...&#10;（每行 128 個 hex 字元，空白與換行會自動忽略）"
+      spellcheck="false"
+      oninput="updateStats()"
+    ></textarea>
+    <div class="stats-bar">
+      <div class="stat-item">LINES: <span class="stat-value" id="statLines">0</span></div>
+      <div class="stat-item">HEX CHARS: <span class="stat-value" id="statChars">0</span></div>
+      <div class="stat-item">BYTES: <span class="stat-value" id="statBytes">0</span></div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-label">02 &mdash; 輸出檔名</div>
+    <div class="filename-row">
+      <label>FILENAME</label>
+      <input type="text" id="filename" value="output.gz" spellcheck="false">
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-label">03 &mdash; 執行</div>
+    <div class="btn-row">
+      <button class="btn-primary" onclick="convert()">▶ CONVERT &amp; DOWNLOAD</button>
+      <button class="btn-secondary" onclick="preview()">◈ PREVIEW HEADER</button>
+      <button class="btn-secondary" onclick="clearAll()">✕ CLEAR</button>
+    </div>
+    <div class="status-panel" id="statusPanel"></div>
+    <div class="preview-panel" id="previewPanel"></div>
+  </div>
+
+  <div class="info-note">
+    <strong>使用說明</strong><br>
+    ① Linux 端：<code style="color:#c8d8e8">gzip -9 -c &lt;file&gt; &gt; file.gz</code>，
+    再執行 <code style="color:#c8d8e8">hexdump -v -e '64/1 "%02x"' -e '"\n"' file.gz</code><br>
+    ② 將輸出的文字全部複製，貼入上方輸入框<br>
+    ③ 設定輸出檔名後點擊 <strong style="color:#00e5ff">CONVERT &amp; DOWNLOAD</strong><br>
+    ④ 下載後以 <code style="color:#c8d8e8">gunzip output.gz</code> 還原原始檔案<br>
+    <br>
+    <strong>注意：</strong>本工具完全在瀏覽器端執行，不需網路，不上傳任何資料<span class="cursor">_</span>
+  </div>
+</div>
+
+<script>
+  function getHexString() {
+    return document.getElementById('hexInput').value
+      .replace(/\s+/g, '')
+      .toLowerCase();
+  }
+
+  function updateStats() {
+    const raw = document.getElementById('hexInput').value;
+    const lines = raw.trim() === '' ? 0 : raw.trim().split('\n').length;
+    const hex = raw.replace(/\s+/g, '');
+    const bytes = Math.floor(hex.length / 2);
+    document.getElementById('statLines').textContent = lines;
+    document.getElementById('statChars').textContent = hex.length;
+    document.getElementById('statBytes').textContent = bytes;
+  }
+
+  function showStatus(msg, type = 'info') {
+    const el = document.getElementById('statusPanel');
+    el.className = 'status-panel visible status-' + type;
+    el.innerHTML = msg;
+  }
+
+  function hexToBytes(hex) {
+    if (hex.length % 2 !== 0) throw new Error('Hex 字串長度必須為偶數（目前：' + hex.length + '）');
+    const bytes = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < hex.length; i += 2) {
+      const val = parseInt(hex.slice(i, i + 2), 16);
+      if (isNaN(val)) throw new Error('非法 hex 字元於位置 ' + i + '：「' + hex.slice(i, i+2) + '」');
+      bytes[i / 2] = val;
+    }
+    return bytes;
+  }
+
+  function validateGzipMagic(bytes) {
+    if (bytes.length < 2) throw new Error('資料太短，無法識別 gzip 格式');
+    if (bytes[0] !== 0x1f || bytes[1] !== 0x8b) {
+      throw new Error(
+        'Magic bytes 不符合 gzip 格式。\n' +
+        '期望：1f 8b，實際：' +
+        bytes[0].toString(16).padStart(2,'0') + ' ' +
+        bytes[1].toString(16).padStart(2,'0') + '\n' +
+        '請確認 hexdump 來源是否為 .gz 檔案。'
+      );
+    }
+  }
+
+  function convert() {
+    try {
+      const hex = getHexString();
+      if (!hex) { showStatus('⚠ 請先貼入 hexdump 內容', 'err'); return; }
+
+      showStatus('⟳ 解析中…', 'info');
+
+      const bytes = hexToBytes(hex);
+      validateGzipMagic(bytes);
+
+      const filename = document.getElementById('filename').value.trim() || 'output.gz';
+      const blob = new Blob([bytes], { type: 'application/gzip' });
+      const url = URL.createObjectURL(blob);
+
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+
+      const kb = (bytes.length / 1024).toFixed(2);
+      showStatus(
+        '✓ 成功！已下載 <strong>' + escHtml(filename) + '</strong><br>' +
+        '　大小：' + bytes.length + ' bytes (' + kb + ' KB)　｜　Hex chars：' + hex.length,
+        'ok'
+      );
+
+      document.getElementById('previewPanel').className = 'preview-panel';
+    } catch (e) {
+      showStatus('✗ 錯誤：' + escHtml(e.message.replace(/\n/g, '<br>　')), 'err');
+    }
+  }
+
+  function preview() {
+    try {
+      const hex = getHexString();
+      if (!hex) { showStatus('⚠ 請先貼入 hexdump 內容', 'err'); return; }
+
+      const bytes = hexToBytes(hex.slice(0, 256)); // preview first 128 bytes
+      validateGzipMagic(bytes);
+
+      const panel = document.getElementById('previewPanel');
+      let html = '<div style="color:var(--accent);font-size:10px;letter-spacing:2px;margin-bottom:8px;">HEADER PREVIEW (first 128 bytes)</div>';
+
+      const previewBytes = bytes.slice(0, 128);
+      for (let row = 0; row < previewBytes.length; row += 16) {
+        const chunk = previewBytes.slice(row, row + 16);
+        const hexPart = Array.from(chunk).map(b => b.toString(16).padStart(2,'0')).join(' ');
+        const asciiPart = Array.from(chunk).map(b => (b >= 0x20 && b < 0x7f) ? String.fromCharCode(b) : '·').join('');
+        html += '<div class="hex-row">'
+          + '<span class="hex-offset">' + row.toString(16).padStart(4,'0') + '</span>'
+          + '<span class="hex-bytes">' + hexPart.padEnd(47) + '</span>'
+          + '<span class="hex-ascii"> ' + escHtml(asciiPart) + '</span>'
+          + '</div>';
+      }
+
+      // Parse gzip header fields
+      const cm = bytes[2];
+      const flg = bytes[3];
+      const mtime = (bytes[7]<<24|bytes[6]<<16|bytes[5]<<8|bytes[4]) >>> 0;
+      const xfl = bytes[8];
+      const os = bytes[9];
+      const osName = {0:'FAT',3:'Unix',7:'MacOS',11:'NTFS',255:'Unknown'}[os] || 'OS#'+os;
+      const flagNames = [];
+      if (flg & 0x01) flagNames.push('FTEXT');
+      if (flg & 0x02) flagNames.push('FHCRC');
+      if (flg & 0x04) flagNames.push('FEXTRA');
+      if (flg & 0x08) flagNames.push('FNAME');
+      if (flg & 0x10) flagNames.push('FCOMMENT');
+
+      html += '<div style="margin-top:12px;color:var(--accent2);font-size:10px;letter-spacing:2px;">PARSED HEADER</div>';
+      html += '<div style="margin-top:4px;color:var(--dim);">'
+        + 'Magic: <span style="color:var(--accent)">1f 8b</span> ✓ gzip　｜　'
+        + 'CM: ' + cm + ' (deflate)　｜　'
+        + 'FLG: 0x' + flg.toString(16).padStart(2,'0') + (flagNames.length ? ' [' + flagNames.join(',') + ']' : '')
+        + '<br>MTIME: ' + (mtime === 0 ? 'none' : new Date(mtime*1000).toISOString())
+        + '　｜　XFL: ' + xfl + '　｜　OS: ' + osName
+        + '</div>';
+
+      panel.innerHTML = html;
+      panel.className = 'preview-panel visible';
+      showStatus('◈ Header 解析完成，gzip 格式確認 ✓', 'ok');
+    } catch (e) {
+      showStatus('✗ ' + escHtml(e.message.replace(/\n/g, '<br>　')), 'err');
+    }
+  }
+
+  function clearAll() {
+    document.getElementById('hexInput').value = '';
+    document.getElementById('filename').value = 'output.gz';
+    document.getElementById('statusPanel').className = 'status-panel';
+    document.getElementById('previewPanel').className = 'preview-panel';
+    updateStats();
+  }
+
+  function escHtml(s) {
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+</script>
+</body>
+</html>
