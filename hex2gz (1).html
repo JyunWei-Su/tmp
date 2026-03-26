@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HEX → GZ / GPG Converter</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@300;500;700&display=swap');
+
+  :root {
+    --bg: #0a0c0f;
+    --panel: #0f1318;
+    --border: #1e2a38;
+    --accent: #00e5ff;
+    --accent2: #00ff9d;
+    --accent3: #c084fc;
+    --warn: #ff6b35;
+    --text: #c8d8e8;
+    --dim: #4a6070;
+    --glow: 0 0 20px rgba(0,229,255,0.3);
+    --glow2: 0 0 20px rgba(0,255,157,0.3);
+    --glow3: 0 0 20px rgba(192,132,252,0.3);
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Share Tech Mono', monospace;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image:
+      linear-gradient(rgba(0,229,255,0.025) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,229,255,0.025) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .container {
+    position: relative;
+    z-index: 1;
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 40px 24px 60px;
+  }
+
+  header { margin-bottom: 48px; position: relative; }
+
+  .header-tag {
+    font-size: 11px;
+    letter-spacing: 4px;
+    color: var(--accent);
+    opacity: 0.7;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+  }
+
+  h1 {
+    font-family: 'Rajdhani', sans-serif;
+    font-weight: 700;
+    font-size: clamp(32px, 6vw, 52px);
+    letter-spacing: 2px;
+    line-height: 1;
+    color: #fff;
+  }
+
+  h1 .gz  { color: var(--accent);  text-shadow: var(--glow); }
+  h1 .gpg { color: var(--accent3); text-shadow: var(--glow3); }
+
+  .subtitle {
+    margin-top: 10px;
+    font-size: 13px;
+    color: var(--dim);
+    letter-spacing: 1px;
+    line-height: 1.8;
+  }
+
+  .subtitle code {
+    font-size: 11px;
+    padding: 2px 6px;
+    border-radius: 3px;
+  }
+  .subtitle code.gz  { color: var(--accent2); background: rgba(0,255,157,0.07); }
+  .subtitle code.gpg { color: var(--accent3); background: rgba(192,132,252,0.07); }
+
+  .divider {
+    height: 1px;
+    background: linear-gradient(90deg, var(--accent), transparent);
+    margin: 20px 0 0;
+    opacity: 0.35;
+  }
+
+  .format-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 14px;
+    padding: 6px 14px;
+    border-radius: 3px;
+    font-size: 11px;
+    letter-spacing: 2px;
+    font-family: 'Rajdhani', sans-serif;
+    font-weight: 700;
+    text-transform: uppercase;
+    transition: all 0.3s;
+    opacity: 0;
+  }
+  .format-badge.visible { opacity: 1; }
+  .format-badge.gz      { background: rgba(0,229,255,0.08);  border: 1px solid rgba(0,229,255,0.25);  color: var(--accent); }
+  .format-badge.gpg     { background: rgba(192,132,252,0.08); border: 1px solid rgba(192,132,252,0.25); color: var(--accent3); }
+  .format-badge.unknown { background: rgba(255,107,53,0.08); border: 1px solid rgba(255,107,53,0.25); color: var(--warn); }
+
+  .dot { width: 6px; height: 6px; border-radius: 50%; animation: pulse 1.5s infinite; }
+  .gz  .dot { background: var(--accent); }
+  .gpg .dot { background: var(--accent3); }
+  .unknown .dot { background: var(--warn); }
+
+  @keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.4;transform:scale(.7)} }
+
+  .section { margin-bottom: 28px; }
+
+  .section-label {
+    font-size: 10px;
+    letter-spacing: 3px;
+    color: var(--accent);
+    text-transform: uppercase;
+    margin-bottom: 10px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .section-label::after { content:''; flex:1; height:1px; background:var(--border); }
+
+  textarea {
+    width: 100%;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 13px;
+    line-height: 1.7;
+    padding: 16px;
+    border-radius: 4px;
+    resize: vertical;
+    min-height: 220px;
+    outline: none;
+    transition: border-color 0.2s, box-shadow 0.2s;
+    letter-spacing: 0.5px;
+  }
+  textarea:focus { border-color: var(--accent); box-shadow: var(--glow), inset 0 0 30px rgba(0,229,255,0.02); }
+  textarea::placeholder { color: var(--dim); }
+
+  .stats-bar {
+    display: flex;
+    gap: 20px;
+    margin-top: 8px;
+    font-size: 11px;
+    color: var(--dim);
+    letter-spacing: 1px;
+    flex-wrap: wrap;
+  }
+  .stat-item { display: flex; align-items: center; gap: 6px; }
+  .stat-value { color: var(--accent2); }
+
+  .filename-row { display: flex; gap: 12px; align-items: center; margin-bottom: 20px; }
+  .filename-row label { font-size:11px; letter-spacing:2px; color:var(--dim); white-space:nowrap; text-transform:uppercase; }
+
+  input[type="text"] {
+    flex: 1;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 13px;
+    padding: 10px 14px;
+    border-radius: 4px;
+    outline: none;
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+  input[type="text"]:focus { border-color: var(--accent); box-shadow: var(--glow); }
+
+  .btn-row { display: flex; gap: 12px; flex-wrap: wrap; }
+
+  button {
+    cursor: pointer;
+    font-family: 'Rajdhani', sans-serif;
+    font-weight: 700;
+    font-size: 14px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    padding: 12px 28px;
+    border-radius: 3px;
+    border: none;
+    transition: all 0.2s;
+    position: relative;
+    overflow: hidden;
+  }
+  button::after { content:''; position:absolute; inset:0; background:rgba(255,255,255,0.05); opacity:0; transition:opacity 0.2s; }
+  button:hover::after { opacity:1; }
+  button:active { transform: scale(0.98); }
+
+  .btn-primary { background: var(--accent); color: #000; box-shadow: var(--glow); }
+  .btn-primary:hover { box-shadow: 0 0 30px rgba(0,229,255,0.5); }
+  .btn-secondary { background: transparent; color: var(--dim); border: 1px solid var(--border); }
+  .btn-secondary:hover { border-color: var(--dim); color: var(--text); }
+
+  .status-panel {
+    margin-top: 20px;
+    padding: 14px 16px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-size: 12px;
+    line-height: 1.8;
+    display: none;
+    min-height: 56px;
+  }
+  .status-panel.visible { display: block; }
+  .status-ok   { border-left: 3px solid var(--accent2); color: var(--accent2); }
+  .status-err  { border-left: 3px solid var(--warn);    color: var(--warn); }
+  .status-info { border-left: 3px solid var(--accent);  color: var(--text); }
+
+  .preview-panel {
+    margin-top: 16px;
+    padding: 14px 16px;
+    background: rgba(0,229,255,0.02);
+    border: 1px solid rgba(0,229,255,0.08);
+    border-radius: 4px;
+    font-size: 11px;
+    color: var(--dim);
+    display: none;
+    word-break: break-all;
+    line-height: 1.9;
+  }
+  .preview-panel.visible  { display: block; }
+  .preview-panel.gpg-mode { background: rgba(192,132,252,0.02); border-color: rgba(192,132,252,0.1); }
+
+  .hex-row    { display:flex; gap:12px; padding:2px 0; }
+  .hex-offset { color:var(--accent); opacity:.5; min-width:50px; }
+  .hex-bytes  { color:var(--text); opacity:.6; }
+  .hex-ascii  { color:var(--accent2); opacity:.5; }
+
+  .parsed-table {
+    margin-top: 10px;
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 2px 16px;
+    font-size: 11px;
+  }
+  .pt-key { color: var(--dim); }
+  .pt-val { color: var(--text); }
+  .pt-val.ok { color: var(--accent2); }
+  .pt-val.hi { color: var(--accent3); }
+
+  .info-note {
+    margin-top: 40px;
+    padding: 16px 20px;
+    background: rgba(255,107,53,0.04);
+    border: 1px solid rgba(255,107,53,0.15);
+    border-radius: 4px;
+    font-size: 11px;
+    color: var(--dim);
+    letter-spacing: 0.5px;
+    line-height: 1.9;
+  }
+  .info-note strong { color: var(--warn); }
+
+  .corner-deco {
+    position: absolute; right:0; top:0;
+    width:60px; height:60px;
+    border-top:1px solid var(--accent);
+    border-right:1px solid var(--accent);
+    opacity:.2;
+  }
+
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+  .cursor { animation: blink 1s infinite; }
+
+  @keyframes fadeIn { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
+  .container > * { animation: fadeIn 0.4s ease both; }
+  header                    { animation-delay: 0.00s; }
+  .section:nth-of-type(1)   { animation-delay: 0.07s; }
+  .section:nth-of-type(2)   { animation-delay: 0.12s; }
+  .section:nth-of-type(3)   { animation-delay: 0.17s; }
+  .info-note                { animation-delay: 0.22s; }
+
+  body.is-gpg textarea:focus  { border-color: var(--accent3); box-shadow: var(--glow3), inset 0 0 30px rgba(192,132,252,0.02); }
+  body.is-gpg .section-label  { color: var(--accent3); }
+  body.is-gpg .divider        { background: linear-gradient(90deg, var(--accent3), transparent); }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <div class="corner-deco"></div>
+    <div class="header-tag">// offline utility v2.0</div>
+    <h1>HEX → <span class="gz">GZ</span> / <span class="gpg">GPG</span></h1>
+    <p class="subtitle">
+      支援 <code class="gz">gzip</code> 壓縮檔 及 <code class="gpg">GPG 對稱加密</code> 檔案還原<br>
+      自動偵測格式 &mdash; 貼入 hexdump 後即時判斷
+    </p>
+    <div class="divider"></div>
+    <div class="format-badge" id="formatBadge">
+      <div class="dot"></div>
+      <span id="formatBadgeText">UNKNOWN</span>
+    </div>
+  </header>
+
+  <div class="section">
+    <div class="section-label">01 &mdash; hex dump 輸入</div>
+    <textarea id="hexInput"
+      placeholder="貼上 hexdump 輸出內容&#10;&#10;gzip  開頭：1f8b...&#10;GPG   開頭：OpenPGP packet tag byte（如 8c0d / c30d / a30d...）&#10;&#10;空白與換行會自動忽略"
+      spellcheck="false"
+      oninput="updateStats()"
+    ></textarea>
+    <div class="stats-bar">
+      <div class="stat-item">LINES: <span class="stat-value" id="statLines">0</span></div>
+      <div class="stat-item">HEX CHARS: <span class="stat-value" id="statChars">0</span></div>
+      <div class="stat-item">BYTES: <span class="stat-value" id="statBytes">0</span></div>
+      <div class="stat-item">FORMAT: <span class="stat-value" id="statFmt">—</span></div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-label">02 &mdash; 輸出檔名</div>
+    <div class="filename-row">
+      <label>FILENAME</label>
+      <input type="text" id="filename" value="output.gz" spellcheck="false">
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-label">03 &mdash; 執行</div>
+    <div class="btn-row">
+      <button class="btn-primary" onclick="convert()">&#9654; CONVERT &amp; DOWNLOAD</button>
+      <button class="btn-secondary" onclick="preview()">&#9672; PREVIEW HEADER</button>
+      <button class="btn-secondary" onclick="clearAll()">&#10005; CLEAR</button>
+    </div>
+    <div class="status-panel" id="statusPanel"></div>
+    <div class="preview-panel" id="previewPanel"></div>
+  </div>
+
+  <div class="info-note">
+    <strong>Linux 端產生方式</strong><br><br>
+    【GZ 壓縮】<br>
+    &nbsp;&nbsp;<code style="color:#c8d8e8">gzip -9 -c &lt;file&gt; &gt; file.gz</code><br>
+    &nbsp;&nbsp;<code style="color:#c8d8e8">hexdump -v -e '64/1 "%02x"' -e '"\n"' file.gz</code><br><br>
+    【GPG 對稱加密】<br>
+    &nbsp;&nbsp;<code style="color:#c8d8e8">gpg --symmetric --cipher-algo AES256 -o file.gpg &lt;file&gt;</code><br>
+    &nbsp;&nbsp;<code style="color:#c8d8e8">hexdump -v -e '64/1 "%02x"' -e '"\n"' file.gpg</code><br><br>
+    ① 複製輸出文字，貼入上方輸入框（格式自動偵測）<br>
+    ② 設定輸出檔名後點擊 <strong style="color:#00e5ff">CONVERT &amp; DOWNLOAD</strong><br>
+    ③ 解密：<code style="color:#c8d8e8">gpg --decrypt file.gpg &gt; output</code><br><br>
+    <strong>注意：</strong>完全在瀏覽器端執行，不需網路，不上傳任何資料<span class="cursor">_</span>
+  </div>
+</div>
+
+<script>
+  // ── Hex utilities ────────────────────────────────────────────────
+  function getHexString() {
+    return document.getElementById('hexInput').value.replace(/\s+/g, '').toLowerCase();
+  }
+
+  function hexToBytes(hex) {
+    if (hex.length % 2 !== 0)
+      throw new Error('Hex 字串長度必須為偶數（目前：' + hex.length + '）');
+    const bytes = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < hex.length; i += 2) {
+      const val = parseInt(hex.slice(i, i + 2), 16);
+      if (isNaN(val))
+        throw new Error('非法 hex 字元於位置 ' + i + '：「' + hex.slice(i, i + 2) + '」');
+      bytes[i / 2] = val;
+    }
+    return bytes;
+  }
+
+  function hexToBytesSafe(hex) {
+    const bytes = new Uint8Array(Math.floor(hex.length / 2));
+    for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(hex.slice(i*2, i*2+2), 16) || 0;
+    return bytes;
+  }
+
+  // ── Format detection ─────────────────────────────────────────────
+  function detectFormat(bytes) {
+    if (bytes.length < 2) return 'unknown';
+    // gzip magic bytes
+    if (bytes[0] === 0x1f && bytes[1] === 0x8b) return 'gz';
+    // OpenPGP: first byte must have bit 7 set
+    const b = bytes[0];
+    if (b & 0x80) {
+      const tag = (b & 0x40) ? (b & 0x3f) : ((b & 0x3c) >> 2);
+      // Symmetric-Key Encrypted Session Key (3), Sym Enc Data (9),
+      // Sym Enc Integrity Protected Data (18), AEAD (20), Literal (11)
+      if (tag >= 1 && tag <= 20) return 'gpg';
+    }
+    return 'unknown';
+  }
+
+  // ── GPG lookup tables ────────────────────────────────────────────
+  const PKT_NAMES = {
+    1:'Public-Key Encrypted Session Key', 2:'Signature',
+    3:'Symmetric-Key Encrypted Session Key (SKESK)', 4:'One-Pass Signature',
+    5:'Secret-Key', 6:'Public-Key', 7:'Secret-Subkey', 8:'Compressed Data',
+    9:'Symmetrically Encrypted Data', 10:'Marker', 11:'Literal Data',
+    12:'Trust', 13:'User ID', 14:'Public-Subkey', 17:'User Attribute',
+    18:'Sym. Encrypted Integrity Protected Data (SEIPD)',
+    19:'Modification Detection Code', 20:'AEAD Encrypted Data',
+  };
+  const CIPHER = {0:'Plaintext',2:'3DES',3:'CAST5',4:'Blowfish',7:'AES-128',8:'AES-192',9:'AES-256',10:'Twofish',11:'Camellia-128',12:'Camellia-192',13:'Camellia-256'};
+  const HASH   = {1:'MD5',2:'SHA-1',3:'RIPEMD-160',8:'SHA-256',9:'SHA-384',10:'SHA-512',11:'SHA-224'};
+  const S2K    = {0:'Simple',1:'Salted',3:'Iterated+Salted (GNU default)'};
+  const AEAD   = {1:'EAX',2:'OCB'};
+
+  function parseGpgPackets(bytes) {
+    const packets = [];
+    let i = 0;
+    while (i < bytes.length && packets.length < 4) {
+      const b = bytes[i];
+      if (!(b & 0x80)) break;
+      let tag, bodyLen;
+      if (b & 0x40) {
+        tag = b & 0x3f; i++;
+        if (i >= bytes.length) break;
+        const l0 = bytes[i];
+        if (l0 < 192)       { bodyLen = l0; i++; }
+        else if (l0 < 224)  { if (i+1>=bytes.length) break; bodyLen = ((l0-192)<<8)+bytes[i+1]+192; i+=2; }
+        else if (l0 === 255){ if (i+4>=bytes.length) break; bodyLen=(bytes[i+1]<<24|bytes[i+2]<<16|bytes[i+3]<<8|bytes[i+4])>>>0; i+=5; }
+        else                { bodyLen = 1<<(l0&0x1f); i++; }
+      } else {
+        tag = (b & 0x3c) >> 2;
+        const lt = b & 0x03; i++;
+        if (lt===0)      { bodyLen=bytes[i]; i++; }
+        else if (lt===1) { bodyLen=(bytes[i]<<8)|bytes[i+1]; i+=2; }
+        else if (lt===2) { bodyLen=(bytes[i]<<24|bytes[i+1]<<16|bytes[i+2]<<8|bytes[i+3])>>>0; i+=4; }
+        else             { bodyLen=bytes.length-i; }
+      }
+      const pkt = { tag, name: PKT_NAMES[tag]||('Unknown (#'+tag+')'), bodyLen, fields: [] };
+      const body = bytes.slice(i, i + Math.min(bodyLen, 64));
+
+      if (tag === 3 && body.length >= 4) {
+        const ver = body[0];
+        pkt.fields.push(['Version', ver]);
+        if (ver === 4) {
+          pkt.fields.push(['Cipher', (CIPHER[body[1]]||'#'+body[1])]);
+          pkt.fields.push(['S2K Type', (S2K[body[2]]||'#'+body[2])]);
+          if (body.length > 3) pkt.fields.push(['S2K Hash', (HASH[body[3]]||'#'+body[3])]);
+          const s2kType = body[2];
+          if ((s2kType===1||s2kType===3) && body.length>=12) {
+            pkt.fields.push(['S2K Salt', Array.from(body.slice(4,12)).map(x=>x.toString(16).padStart(2,'0')).join('')]);
+          }
+          if (s2kType===3 && body.length>=13) {
+            const c = body[12];
+            pkt.fields.push(['Iterations', ((16+(c&15))<<((c>>4)+6)).toLocaleString()]);
+          }
+        } else if (ver === 5) {
+          pkt.fields.push(['Cipher', (CIPHER[body[1]]||'#'+body[1])]);
+          pkt.fields.push(['AEAD', (AEAD[body[2]]||'#'+body[2])]);
+        }
+      } else if (tag === 18 && body.length >= 1) {
+        pkt.fields.push(['Version', body[0]]);
+        pkt.fields.push(['Payload', bodyLen + ' bytes (encrypted)']);
+      } else if (tag === 20 && body.length >= 3) {
+        pkt.fields.push(['Version', body[0]]);
+        pkt.fields.push(['AEAD', (AEAD[body[1]]||'#'+body[1])]);
+        pkt.fields.push(['Cipher', (CIPHER[body[2]]||'#'+body[2])]);
+      } else if (tag === 9) {
+        pkt.fields.push(['Payload', bodyLen + ' bytes (encrypted)']);
+      }
+      packets.push(pkt);
+      i += bodyLen;
+    }
+    return packets;
+  }
+
+  // ── UI ───────────────────────────────────────────────────────────
+  function escHtml(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  function showStatus(msg, type) {
+    const el = document.getElementById('statusPanel');
+    el.className = 'status-panel visible status-' + (type||'info');
+    el.innerHTML = msg;
+  }
+
+  let _lastFmt = '';
+
+  function updateStats() {
+    const raw = document.getElementById('hexInput').value;
+    const lines = raw.trim() === '' ? 0 : raw.trim().split('\n').length;
+    const hex = raw.replace(/\s+/g, '');
+    document.getElementById('statLines').textContent = lines;
+    document.getElementById('statChars').textContent = hex.length;
+    document.getElementById('statBytes').textContent = Math.floor(hex.length / 2);
+
+    let fmt = 'unknown';
+    if (hex.length >= 4) {
+      fmt = detectFormat(hexToBytesSafe(hex.slice(0, 20)));
+    }
+    document.getElementById('statFmt').textContent =
+      fmt === 'gz' ? 'GZIP' : fmt === 'gpg' ? 'GPG/PGP' : '—';
+
+    const badge = document.getElementById('formatBadge');
+    if (hex.length >= 4) {
+      badge.className = 'format-badge visible ' + (fmt === 'unknown' ? 'unknown' : fmt);
+      document.getElementById('formatBadgeText').textContent =
+        fmt === 'gz'  ? 'GZIP 格式偵測' :
+        fmt === 'gpg' ? 'GPG / OpenPGP 格式偵測' : '未知格式';
+    } else {
+      badge.className = 'format-badge';
+    }
+
+    if (fmt !== _lastFmt && hex.length >= 4) {
+      _lastFmt = fmt;
+      const fn = document.getElementById('filename');
+      if (fmt === 'gz'  && !fn.value.endsWith('.gz'))
+        fn.value = fn.value.replace(/\.(gpg|pgp|asc|bin)$/, '').replace(/^$/, 'output') + '.gz';
+      if (fmt === 'gpg' && !fn.value.endsWith('.gpg'))
+        fn.value = fn.value.replace(/\.gz$/, '').replace(/^$/, 'output') + '.gpg';
+    }
+
+    document.body.className = fmt === 'gpg' ? 'is-gpg' : '';
+  }
+
+  function convert() {
+    try {
+      const hex = getHexString();
+      if (!hex) { showStatus('&#9888; 請先貼入 hexdump 內容', 'err'); return; }
+      showStatus('&#8635; 解析中…', 'info');
+
+      const bytes = hexToBytes(hex);
+      const fmt = detectFormat(bytes);
+
+      if (fmt === 'unknown') {
+        throw new Error(
+          '無法識別格式。\n開頭 bytes：' +
+          Array.from(bytes.slice(0,4)).map(b=>b.toString(16).padStart(2,'0')).join(' ') +
+          '\n• gzip 應為：1f 8b\n• GPG  應為：OpenPGP packet tag（bit7=1）'
+        );
+      }
+
+      const filename = document.getElementById('filename').value.trim() || ('output.' + fmt);
+      const mime = fmt === 'gz' ? 'application/gzip' : 'application/pgp-encrypted';
+      const blob = new Blob([bytes], { type: mime });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = filename;
+      document.body.appendChild(a); a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+
+      const kb = (bytes.length / 1024).toFixed(2);
+      const fmtLabel = fmt === 'gz'
+        ? '<span style="color:var(--accent)">GZIP</span>'
+        : '<span style="color:var(--accent3)">GPG / OpenPGP</span>';
+      showStatus(
+        '&#10003; 成功！已下載 <strong>' + escHtml(filename) + '</strong><br>' +
+        '&nbsp;&nbsp;格式：' + fmtLabel + '&nbsp;&nbsp;|&nbsp;&nbsp;大小：' + bytes.length + ' bytes (' + kb + ' KB)',
+        'ok'
+      );
+      document.getElementById('previewPanel').className = 'preview-panel';
+    } catch (e) {
+      showStatus('&#10007; 錯誤：' + escHtml(e.message.replace(/\n/g, '<br>&nbsp;&nbsp;')), 'err');
+    }
+  }
+
+  function preview() {
+    try {
+      const hex = getHexString();
+      if (!hex) { showStatus('&#9888; 請先貼入 hexdump 內容', 'err'); return; }
+
+      const allBytes = hexToBytes(hex);
+      const fmt = detectFormat(allBytes);
+      const bytes = allBytes.slice(0, 128);
+      const panel = document.getElementById('previewPanel');
+      const accentColor = fmt === 'gpg' ? 'var(--accent3)' : 'var(--accent)';
+
+      let html = '<div style="font-size:10px;letter-spacing:2px;margin-bottom:8px;color:' + accentColor + '">HEADER PREVIEW (first 128 bytes)</div>';
+
+      for (let row = 0; row < bytes.length; row += 16) {
+        const chunk = bytes.slice(row, row + 16);
+        const hp = Array.from(chunk).map(b => b.toString(16).padStart(2,'0')).join(' ');
+        const ap = Array.from(chunk).map(b => (b>=0x20&&b<0x7f)?String.fromCharCode(b):'·').join('');
+        html += '<div class="hex-row">'
+          + '<span class="hex-offset">' + row.toString(16).padStart(4,'0') + '</span>'
+          + '<span class="hex-bytes">' + hp.padEnd(47) + '</span>'
+          + '<span class="hex-ascii"> ' + escHtml(ap) + '</span>'
+          + '</div>';
+      }
+
+      html += '<div class="parsed-table" style="margin-top:14px;">';
+
+      if (fmt === 'gz') {
+        const flg = allBytes[3];
+        const mtime = (allBytes[7]<<24|allBytes[6]<<16|allBytes[5]<<8|allBytes[4])>>>0;
+        const osMap = {0:'FAT',3:'Unix',7:'MacOS',11:'NTFS',255:'Unknown'};
+        const flags = [];
+        if (flg&1) flags.push('FTEXT'); if (flg&2) flags.push('FHCRC');
+        if (flg&4) flags.push('FEXTRA'); if (flg&8) flags.push('FNAME');
+        if (flg&16) flags.push('FCOMMENT');
+        const rows = [
+          ['Magic',  '<span class="pt-val ok">1f 8b &#10003; gzip</span>'],
+          ['CM',     allBytes[2] + ' (deflate)'],
+          ['FLG',    '0x'+flg.toString(16).padStart(2,'0')+(flags.length?' ['+flags.join(', ')+']':'')],
+          ['MTIME',  mtime===0?'none':new Date(mtime*1000).toISOString()],
+          ['OS',     osMap[allBytes[9]]||'OS#'+allBytes[9]],
+          ['Total',  allBytes.length + ' bytes'],
+        ];
+        for (const [k,v] of rows)
+          html += '<span class="pt-key">'+escHtml(k)+'</span><span class="pt-val">'+v+'</span>';
+
+      } else if (fmt === 'gpg') {
+        const pkts = parseGpgPackets(allBytes);
+        pkts.forEach((pkt, idx) => {
+          html += '<span class="pt-key" style="color:var(--accent3);grid-column:1/-1;margin-top:'+(idx?'8px':'2px')+'">Packet #'+(idx+1)+'</span>';
+          html += '<span class="pt-key">Tag</span><span class="pt-val hi">'+pkt.tag+' &mdash; '+escHtml(pkt.name)+'</span>';
+          html += '<span class="pt-key">Body size</span><span class="pt-val">'+pkt.bodyLen+' bytes</span>';
+          for (const [k,v] of pkt.fields)
+            html += '<span class="pt-key">'+escHtml(k)+'</span><span class="pt-val ok">'+escHtml(String(v))+'</span>';
+        });
+        html += '<span class="pt-key" style="margin-top:8px">Total</span><span class="pt-val">'+allBytes.length+' bytes</span>';
+
+      } else {
+        html += '<span style="color:var(--warn)">未知格式，無法解析 header</span>';
+      }
+
+      html += '</div>';
+      panel.innerHTML = html;
+      panel.className = 'preview-panel visible' + (fmt==='gpg'?' gpg-mode':'');
+
+      showStatus(
+        fmt==='gz'  ? '&#9672; Header 解析完成，gzip 格式確認 &#10003;' :
+        fmt==='gpg' ? '&#9672; Header 解析完成，GPG / OpenPGP 格式確認 &#10003;' :
+                      '&#9888; 格式未知',
+        fmt==='unknown'?'err':'ok'
+      );
+    } catch (e) {
+      showStatus('&#10007; ' + escHtml(e.message.replace(/\n/g,'<br>&nbsp;&nbsp;')), 'err');
+    }
+  }
+
+  function clearAll() {
+    document.getElementById('hexInput').value = '';
+    document.getElementById('filename').value = 'output.gz';
+    document.getElementById('statusPanel').className = 'status-panel';
+    document.getElementById('previewPanel').className = 'preview-panel';
+    document.getElementById('formatBadge').className = 'format-badge';
+    document.getElementById('statFmt').textContent = '—';
+    document.body.className = '';
+    _lastFmt = '';
+    updateStats();
+  }
+</script>
+</body>
+</html>
