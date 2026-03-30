@@ -1,0 +1,1428 @@
+#!/cld/tools/python3.8.8/bin/python3.8
+#############################################
+# File name : PartitionTimingStatus_v2
+# Brief     : Unified Partition Timing Status tool
+#             --from    : Extract mode  (parse STA dirs from config)
+#             --diff    : Diff mode     (compare two timing status files)
+#             --example : Template mode (generate sample config.ods)
+# Version   : 2026/03/27 (2.0 unified & refactored from v1.x)
+# Author    : 
+#############################################
+
+import gzip
+import os
+import glob
+import sys
+import re
+import fnmatch
+import zipfile
+import tempfile
+import subprocess
+import logging
+import argparse
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, List, Optional
+
+import pandas as pd
+import openpyxl
+from openpyxl import load_workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from rich.console import Console
+from rich.progress import Progress, TextColumn, BarColumn, MofNCompleteColumn
+
+_console = Console()
+
+__VERSION__ = 2.0
+
+# ═══════════════════════════════════════════════════════════════
+# 1. Terminal colors
+# ═══════════════════════════════════════════════════════════════
+COLOR_R  = "\033[31m"
+COLOR_G  = "\033[32m"
+COLOR_Y  = "\033[33m"
+NO_COLOR = "\033[0m"
+
+
+# ═══════════════════════════════════════════════════════════════
+# 2. Column name constants
+#
+# Rules:
+#   - BigEndian (PascalCase) with no underscores
+#   - Acronyms stay all-caps: BE, SI, APR, REG, IN, OUT
+#   - SI/nSI keeps the slash (domain notation)
+#   - Parentheses allowed: Setup(Total), MaxTransVio(lt-0.1/Total)
+#   - Underscore only for suffixes: _v{mmdd}, _diff
+# ═══════════════════════════════════════════════════════════════
+COL_PARTITION        = "Partition"
+COL_BEOWNER          = "BEOwner"
+COL_APR_STAGE        = "APRStage"
+COL_SI_NSI           = "SI/nSI"
+COL_SI_PARAMS_ERRORS = "SIParamsErrors"
+COL_FILE_ADDR        = "FileAddr"
+COL_COMMENT          = "Comment"
+COL_MAX_CAP_VIO      = "MaxCapVio"
+COL_MIN_PULSE_WIDTH  = "MinPulseWidth"
+COL_MIN_PERIOD       = "MinPeriod"
+COL_NOISE            = "Noise"
+COL_DOUBLE_SWITCHING = "DoubleSwitching"
+
+# Path categories used in Setup/Hold columns
+PATH_CATEGORIES = ["Total", "REG2REG", "IN2REG", "REG2OUT", "IN2OUT"]
+
+
+def col_setup(cat: str) -> str:
+    return f"Setup({cat})"
+
+
+def col_hold(cat: str) -> str:
+    return f"Hold({cat})"
+
+
+def col_max_trans_vio(threshold: float) -> str:
+    return f"MaxTransVio(lt{threshold}/Total)"
+
+
+# Config file column names (for --from / --example)
+CFG_COL_PARTITION = "Partition"
+CFG_COL_BEOWNER   = "BEOwner"
+CFG_COL_STA_DIR   = "StaOutputDir"
+
+
+# ═══════════════════════════════════════════════════════════════
+# 3. Style constants & pluggable color rule
+# ═══════════════════════════════════════════════════════════════
+FILL_HEADER    = PatternFill(fill_type="solid", fgColor="FFFF00")  # Yellow
+FILL_ROW_EVEN  = PatternFill(fill_type="solid", fgColor="FFEEEE")  # Light red
+FILL_ROW_ODD   = PatternFill(fill_type="solid", fgColor="EEEEFF")  # Light blue
+FILL_DIFF_EVEN = PatternFill(fill_type="solid", fgColor="FFCCCC")  # Dark red
+FILL_DIFF_ODD  = PatternFill(fill_type="solid", fgColor="CCCCFF")  # Dark blue
+
+
+@dataclass
+class CellColorRule:
+    """
+    Pluggable per-cell color rule applied after base row colors.
+
+    col_pattern : fnmatch pattern matched against column header string
+    condition   : callable(cell_value) -> bool
+    font_color  : hex string e.g. "FF0000", or None to keep existing font
+    fill_color  : hex string e.g. "FFA500", or None to keep existing fill
+    """
+    col_pattern : str
+    condition   : Callable
+    font_color  : Optional[str] = None
+    fill_color  : Optional[str] = None
+
+
+# Default rules — add entries here to extend coloring logic
+EXTRACT_COLOR_RULES: List[CellColorRule] = [
+    CellColorRule(
+        col_pattern = COL_SI_PARAMS_ERRORS,
+        condition   = lambda v: isinstance(v, (int, float)) and v > 0,
+        font_color  = "FF0000",
+    ),
+    # Future: flag WNS violations, highlight owners, etc.
+]
+
+DIFF_COLOR_RULES: List[CellColorRule] = [
+    CellColorRule(
+        col_pattern = "*_diff",
+        condition   = lambda v: isinstance(v, (int, float)) and v > 0,
+        font_color  = "FF0000",
+    ),
+    # Future: flag regressions beyond threshold, etc.
+]
+
+
+def _timing_diff_font_color(raw) -> Optional[str]:
+    """
+    Determine font color for a Setup(*) / Hold(*) _diff cell.
+    Cell value is a scalar (NVP-only diff) or 'WNS_diff / TNS_diff / NVP_diff'.
+
+    Per-token improvement direction:
+      index 0 (WNS) : > 0 is good (improved)
+      index 1 (TNS) : > 0 is good (improved)
+      index 2 (NVP) : < 0 is good (fewer violations)
+
+    Overall cell color (most conservative):
+      - Any token violates its rule → red  "FF0000"
+      - All tokens improved         → green "00AA00"
+      - All tokens = 0              → black (None)
+      - NA / err / non-numeric      → black (None)
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        # scalar: treat as WNS-style (positive = improved)
+        v = float(raw)
+        if v < 0:
+            return "FF0000"
+        if v > 0:
+            return "00AA00"
+        return None
+
+    parts = [p.strip() for p in str(raw).split('/')]
+    try:
+        tokens = [float(p) for p in parts]
+    except ValueError:
+        return None  # non-numeric (NA, err) → black
+
+    # Map token index → True if "positive direction is good"
+    # index 0=WNS, 1=TNS: higher is better; index 2=NVP: lower is better
+    def _is_bad(idx: int, val: float) -> bool:
+        if idx == 2:          # NVP: violation when > 0
+            return val > 0
+        else:                 # WNS/TNS: violation when < 0
+            return val < 0
+
+    def _is_good(idx: int, val: float) -> bool:
+        if idx == 2:
+            return val < 0
+        else:
+            return val > 0
+
+    if any(_is_bad(i, t) for i, t in enumerate(tokens)):
+        return "FF0000"
+    if all(_is_good(i, t) for i, t in enumerate(tokens)):
+        return "00AA00"
+    return None  # all zero or mixed zero/good → black
+
+
+def _apply_timing_diff_colors(ws, df_out: pd.DataFrame):
+    """
+    Apply red/green/black font to Setup(*) and Hold(*) _diff columns.
+    Must run after _apply_row_colors so fill is already set.
+    """
+    timing_diff_cols = {
+        str(col): idx + 1
+        for idx, col in enumerate(df_out.columns)
+        if isinstance(col, str) and '_diff' in col and
+           (col.startswith('Setup(') or col.startswith('Hold('))
+    }
+    for col_name, col_idx in timing_diff_cols.items():
+        for row_idx in range(2, ws.max_row + 1):
+            cell  = ws.cell(row=row_idx, column=col_idx)
+            color = _timing_diff_font_color(cell.value)
+            if color:
+                cell.font = Font(color=color)
+                cell.alignment = Alignment(
+                    horizontal=cell.alignment.horizontal or 'left',
+                    vertical='center',
+                    wrap_text=cell.alignment.wrap_text,
+                )
+
+
+# ═══════════════════════════════════════════════════════════════
+# 4. Default hidden column patterns (both modes)
+#    Columns are hidden (not deleted) — data remains accessible
+# ═══════════════════════════════════════════════════════════════
+EXTRACT_HIDE_DEFAULT: List[str] = [
+    col_setup("IN2REG"), col_setup("REG2OUT"), col_setup("IN2OUT"),
+    col_hold("IN2REG"),  col_hold("REG2OUT"),  col_hold("IN2OUT"),
+    COL_NOISE, COL_DOUBLE_SWITCHING, COL_FILE_ADDR,
+]
+
+DIFF_HIDE_DEFAULT: List[str] = [
+    "Setup(IN2REG)*", "Setup(REG2OUT)*", "Setup(IN2OUT)*",
+    "Hold(IN2REG)*",  "Hold(REG2OUT)*",  "Hold(IN2OUT)*",
+    f"{COL_NOISE}*",  f"{COL_DOUBLE_SWITCHING}*",
+]
+
+
+# ═══════════════════════════════════════════════════════════════
+# 5. LibreOffice / ODS utilities
+# ═══════════════════════════════════════════════════════════════
+def _get_ps(pattern: str) -> List[str]:
+    """Return list of running process command lines matching pattern (Linux /proc)."""
+    matches = []
+    for pid in filter(str.isdigit, os.listdir('/proc')):
+        try:
+            with open(f'/proc/{pid}/cmdline', 'r') as f:
+                cmd = f.read().replace('\0', ' ')
+                if pattern in cmd:
+                    matches.append(f"{pid} {cmd}")
+        except OSError:
+            continue
+    return matches
+
+
+def check_libreoffice_conflict():
+    """Exit with error if another LibreOffice process is already running."""
+    if _get_ps('libreoffice'):
+        print(f"{COLOR_R}Error: Another LibreOffice process is running. "
+              f"Please close it before running this script.{NO_COLOR}")
+        sys.exit(1)
+
+
+def read_xlsx(filename: str, sheet_name=0) -> pd.DataFrame:
+    file_path = os.path.abspath(filename)
+    print(f"Reading {file_path} ...")
+    return pd.read_excel(file_path, sheet_name=sheet_name, engine='openpyxl')
+
+
+def read_ods(filename: str, sheet_name=0) -> pd.DataFrame:
+    """Convert ODS to XLSX via soffice, read with openpyxl, return DataFrame."""
+    file_path = os.path.abspath(filename)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cmd = ['soffice', '--headless', '--convert-to', 'xlsx', '--outdir', tmp_dir, file_path]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        base      = os.path.splitext(os.path.basename(file_path))[0]
+        converted = os.path.join(tmp_dir, f"{base}.xlsx")
+        print(f"Reading {file_path} ... (converted via soffice)")
+        return pd.read_excel(converted, sheet_name=sheet_name, engine='openpyxl')
+
+
+def read_xlsx_ods(filename: str, sheet_name=0) -> pd.DataFrame:
+    ext = os.path.splitext(filename)[1].lower()
+    if ext == '.xlsx':
+        return read_xlsx(filename, sheet_name=sheet_name)
+    elif ext == '.ods':
+        return read_ods(filename, sheet_name=sheet_name)
+    else:
+        raise ValueError(f"Unsupported file extension: {ext}")
+
+
+def _freeze_cell_to_col_row(freeze: str) -> tuple:
+    """
+    Convert openpyxl freeze_panes string (e.g. 'E2') to
+    0-based (col_index, row_index) for ODS settings.xml.
+    Returns (0, 0) if freeze is None/empty.
+    """
+    if not freeze:
+        return 0, 0
+    m = re.match(r'^([A-Z]+)(\d+)$', freeze.strip().upper())
+    if not m:
+        return 0, 0
+    col_str, row_str = m.group(1), m.group(2)
+    col = 0
+    for ch in col_str:
+        col = col * 26 + (ord(ch) - ord('A') + 1)
+    return col, int(row_str) - 1  # 0-based
+
+
+def _build_views_xml(sheet_name: str, col: int, row: int) -> str:
+    """
+    Build the config:config-item-map-indexed block for the Views entry
+    that encodes freeze panes. This is injected *inside* the existing
+    ooo:view-settings config-item-set in settings.xml.
+
+    col, row are 0-based (e.g. E2 → col=5, row=1).
+    HorizontalSplitMode / VerticalSplitMode = 2 means freeze.
+    """
+    return (
+        '<config:config-item-map-indexed config:name="Views">'
+        '<config:config-item-map-entry>'
+        '<config:config-item config:name="ViewId" config:type="string">view1</config:config-item>'
+        '<config:config-item-map-named config:name="Tables">'
+        f'<config:config-item-map-entry config:name="{sheet_name}">'
+        f'<config:config-item config:name="HorizontalSplitMode" config:type="short">{2 if col else 0}</config:config-item>'
+        f'<config:config-item config:name="VerticalSplitMode" config:type="short">{2 if row else 0}</config:config-item>'
+        f'<config:config-item config:name="HorizontalSplitPosition" config:type="int">{col}</config:config-item>'
+        f'<config:config-item config:name="VerticalSplitPosition" config:type="int">{row}</config:config-item>'
+        f'<config:config-item config:name="PositionLeft" config:type="int">0</config:config-item>'
+        f'<config:config-item config:name="PositionRight" config:type="int">{col}</config:config-item>'
+        f'<config:config-item config:name="PositionTop" config:type="int">0</config:config-item>'
+        f'<config:config-item config:name="PositionBottom" config:type="int">{row}</config:config-item>'
+        '<config:config-item config:name="ZoomType" config:type="short">0</config:config-item>'
+        '<config:config-item config:name="ZoomValue" config:type="int">100</config:config-item>'
+        '<config:config-item config:name="ActiveSplitRange" config:type="short">3</config:config-item>'
+        '</config:config-item-map-entry>'
+        '</config:config-item-map-named>'
+        '</config:config-item-map-entry>'
+        '</config:config-item-map-indexed>'
+    )
+
+
+def _patch_ods_shared_mode(ods_path: str, freeze: str = 'E2',
+                           sheet_name: str = 'Overall'):
+    """
+    Patch ODS zip archive to:
+      1. Set IsDocumentShared = true
+      2. Inject freeze-pane Views block inside the existing ooo:view-settings
+         (soffice conversion produces the set but omits the Views/Tables entries)
+    Rebuilds the zip with mimetype stored uncompressed (ODS spec requirement).
+    """
+    try:
+        col, row = _freeze_cell_to_col_row(freeze)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with zipfile.ZipFile(ods_path, 'r') as zr:
+                zr.extractall(tmp_dir)
+            settings_path = os.path.join(tmp_dir, 'settings.xml')
+            if os.path.exists(settings_path):
+                with open(settings_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+
+                # 1. Patch IsDocumentShared false → true
+                patched = re.sub(
+                    r'(<config:config-item\s+config:name="IsDocumentShared"'
+                    r'\s+config:type="boolean">)false(</config:config-item>)',
+                    r'\1true\2',
+                    content)
+
+                # 2. Inject Views block inside the ooo:view-settings config-item-set.
+                #    soffice always produces this set but never includes Views/Tables,
+                #    so freeze is lost. We insert the Views block just before the
+                #    first </config:config-item-set> that closes ooo:view-settings.
+                VIEW_SET_MARKER = 'config:name="ooo:view-settings"'
+                CLOSE_TAG       = '</config:config-item-set>'
+                if (col or row) and VIEW_SET_MARKER in patched \
+                        and 'config:name="Views"' not in patched:
+                    views_xml  = _build_views_xml(sheet_name, col, row)
+                    insert_at  = patched.index(CLOSE_TAG,
+                                               patched.index(VIEW_SET_MARKER))
+                    patched    = patched[:insert_at] + views_xml + patched[insert_at:]
+
+                with open(settings_path, 'w', encoding='utf-8') as f:
+                    f.write(patched)
+            else:
+                logging.warning(f"settings.xml not found in {ods_path}, skipping patch")
+
+            os.remove(ods_path)
+            tmp = Path(tmp_dir)
+            with zipfile.ZipFile(ods_path, 'w') as zw:
+                if (tmp / 'mimetype').exists():
+                    zw.write(tmp / 'mimetype', 'mimetype', zipfile.ZIP_STORED)
+                for p in tmp.rglob('*'):
+                    if p.is_file() and p.name != 'mimetype':
+                        zw.write(p, p.relative_to(tmp), zipfile.ZIP_DEFLATED)
+    except Exception as e:
+        print(f"{COLOR_R}Error: Failed to patch ODS: {e}{NO_COLOR}")
+
+
+def convert_to_ods_shared(xlsx_path: str, freeze: str = 'E2',
+                          sheet_name: str = 'Overall') -> str:
+    """
+    Convert xlsx → ods via soffice, patch shared edit mode + freeze panes,
+    remove xlsx.  Returns the resulting .ods file path.
+    """
+    cmd = ['soffice', '--headless', '--convert-to', 'ods', xlsx_path]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    os.remove(xlsx_path)
+    ods_path = os.path.splitext(xlsx_path)[0] + '.ods'
+    _patch_ods_shared_mode(ods_path, freeze=freeze, sheet_name=sheet_name)
+    print(f"Output converted to ODS (shared mode + freeze enabled): {ods_path}")
+    return ods_path
+
+
+# ═══════════════════════════════════════════════════════════════
+# 6. STA report parsing
+# ═══════════════════════════════════════════════════════════════
+def _read_file(file_path: str) -> str:
+    """Read plain-text or gzip file; return content string or 'NA' on failure."""
+    try:
+        with open(file_path, 'rb') as f:
+            is_gz = f.read(2) == b'\x1f\x8b'
+        if is_gz:
+            with gzip.open(file_path, 'rt', encoding='utf-8') as f:
+                return f.read()
+        else:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                return f.read()
+    except Exception:
+        return "NA"
+
+
+def parse_pt_log(directory: str):
+    """
+    Parse pt.log for run configuration.
+    Returns (scenario_mode, design_stage, si_enable, design_name).
+    All values default to 'NA' if not found.
+    """
+    pt_log = os.path.join(directory, 'pt.log')
+    if not os.path.exists(pt_log):
+        logging.warning(f"pt.log not found: {pt_log}")
+        return "NA", "NA", "NA", "NA"
+
+    scenario_mode = design_stage = si_enable = design_name = "NA"
+    in_setup = False
+
+    with open(pt_log, 'r', encoding='latin-1') as f:
+        for line in f:
+            if "SETUP_PT.tcl.user" in line or "## My Setting  ##" in line:
+                in_setup = True
+                continue
+            if not in_setup or line.startswith('#'):
+                continue
+            if re.search(r'set\s+SCENARIO_MODE', line):
+                parts = line.split('"')
+                if len(parts) > 1:
+                    scenario_mode = parts[1]
+            elif re.search(r'set\s+DESIGN_STAGE', line):
+                parts = line.split('"')
+                if len(parts) > 1:
+                    design_stage = parts[1]
+            elif re.search(r'set\s+SI_ENABLE', line):
+                parts = line.split('"')
+                if len(parts) > 1:
+                    si_enable = parts[1]
+            elif re.search(r'set\s+DESIGN_NAME', line):
+                in_setup = False
+                parts = line.split('"')
+                if len(parts) > 1:
+                    design_name = parts[1]
+
+    return scenario_mode, design_stage, si_enable, design_name
+
+
+def parse_violations(data: str) -> dict:
+    """
+    Parse *global_timing.report* for Setup/Hold WNS/TNS/NUM.
+
+    Returns:
+        {
+          "Setup": [[wns×5], [tns×5], [num×5]],
+          "Hold":  [[wns×5], [tns×5], [num×5]]
+        }
+    where index 0-4 correspond to PATH_CATEGORIES.
+    """
+    lines     = data.strip().split('\n')
+    result    = {"Setup": [], "Hold": []}
+    current   = None
+    err_flag  = False
+
+    for line in lines:
+        if "Error" in line:
+            err_flag = True
+        line = line.strip()
+        if "Setup violations" in line:
+            current = "Setup"
+        elif "Hold violations" in line:
+            current = "Hold"
+        elif current and (line.startswith("WNS") or
+                          line.startswith("TNS") or
+                          line.startswith("NUM")):
+            result[current].append(line.split()[1:])
+
+    placeholder = lambda: (
+        ['err'] * 5 if err_flag else
+        (['0']  * 5 if data != "NA" else ['NA'] * 5)
+    )
+    for key in result:
+        while len(result[key]) < 3:
+            result[key].append(placeholder())
+
+    return result
+
+
+def parse_pba_violations(data: str, threshold: float, scenario_mode: str) -> tuple:
+    """
+    Parse *PBA_violate.report* for max_transition / max_capacitance /
+    min_period / min_pulse_width sections.
+
+    Returns (sections_dict, err_flag) where sections_dict is:
+        { violation_type: { clock_group: { scenario: {WNS, TNS, NUM, LessThan} } } }
+    """
+    lines            = data.strip().split('\n')
+    err_flag         = False
+    sections         = {}
+    current_section  = 0
+    delay_group      = 0
+    prev_section     = 0
+    prev_delay_group = 0
+    scenarios_dict   = {}
+    prev_lines       = []
+    current_line     = ""
+    max_min_pat      = r'(\w+_delay)/.*?\'(.+?)\'\s+group'
+
+    for line in lines:
+        if "Error" in line:
+            err_flag = True
+        line = line.strip()
+
+        if len(prev_lines) == 6:
+            prev_lines.pop(0)
+        prev_lines.append(line)
+
+        # Section separator: a stripped line with '-' at position 60
+        if line.startswith('-', 60):
+            match = None
+            if scenario_mode == "DMSA" and len(prev_lines) > 1:
+                match = re.search(max_min_pat, prev_lines[1])
+            elif scenario_mode == "single" and len(prev_lines) > 0:
+                match = re.search(max_min_pat, prev_lines[0])
+
+            prev_section     = current_section
+            prev_delay_group = delay_group
+
+            if match:
+                current_section = match.group(1)
+                delay_group     = match.group(2)
+            else:
+                current_section = prev_lines[1] if len(prev_lines) > 1 else ""
+                delay_group     = "NA"
+
+            if current_section not in sections:
+                sections[current_section] = {}
+            if prev_section != 0 and prev_delay_group != 0:
+                sections[prev_section][prev_delay_group] = scenarios_dict
+            sections[current_section][delay_group] = {}
+            scenarios_dict = {}
+            current_line   = ""
+            continue
+
+        if line:
+            current_line = (current_line + " " + line) if current_line else line
+
+        if "VIOLATED" in line:
+            parts      = current_line.split()
+            is_pulse   = "pulse_width" in str(current_section)
+            if scenario_mode == "DMSA":
+                scenario  = parts[2] if is_pulse else parts[1]
+                slack_idx = 5        if is_pulse else 4
+            else:  # single
+                scenario  = "NA"
+                slack_idx = 4 if is_pulse else 3
+            try:
+                slack = float(parts[slack_idx])
+            except (IndexError, ValueError):
+                current_line = ""
+                continue
+
+            if scenario not in scenarios_dict:
+                scenarios_dict[scenario] = {"WNS": slack, "TNS": 0.0, "NUM": 0, "LessThan": 0}
+            s = scenarios_dict[scenario]
+            s["TNS"]      += slack
+            s["NUM"]      += 1
+            s["WNS"]       = min(s["WNS"], slack)
+            if slack < threshold:
+                s["LessThan"] += 1
+            current_line = ""
+
+        if line == "1":
+            sections[current_section][delay_group] = scenarios_dict
+
+    return sections, err_flag
+
+
+def parse_si_noise(data: str):
+    """Count SI noise violations from *report_noise_all_violate.report*."""
+    if data == "NA":
+        return "NA"
+    total      = 0
+    in_section = False
+    for line in data.strip().split('\n'):
+        line = line.strip()
+        if line.startswith("pin name"):
+            in_section = True
+        elif in_section and line and not any(line.startswith(p) for p in ("-", "1", "noise_region")):
+            total += 1
+    return total
+
+
+def parse_si_double_switching(data: str):
+    """Count SI double-switching violations from *report_si_double_switching.report*."""
+    if data == "NA":
+        return "NA"
+    total      = 0
+    in_section = False
+    for line in data.strip().split('\n'):
+        line = line.strip()
+        if line.startswith("~~~~~~~~~~~~~"):
+            in_section = True
+        elif in_section and line and not line.startswith("1"):
+            total += 1
+    return total
+
+
+def parse_si_params(data: str):
+    """Parse SI params error count from *parasitics_command.log*."""
+    if data == "NA":
+        return "NA"
+    for line in data.strip().split('\n'):
+        if 'error(s)' in line:
+            m = re.search(r'\d+', line)
+            return int(m.group()) if m else "NA"
+    return "NA"
+
+
+def _format_violations(violations: list, prefix: str):
+    """
+    Format violations [[wns×5],[tns×5],[num×5]] into column headers and
+    'wns/tns/num' value strings for each path category.
+    """
+    headers = [f"{prefix}({cat})" for cat in PATH_CATEGORIES]
+    values  = [
+        f"{violations[0][i]}/{violations[1][i]}/{violations[2][i]}"
+        for i in range(len(PATH_CATEGORIES))
+    ]
+    if all(v == 'NA/NA/NA' for v in values):
+        values = ['NA'] * len(PATH_CATEGORIES)
+    return headers, values
+
+
+def _sum_pba_section(sections: dict, key: str) -> tuple:
+    """Aggregate WNS/TNS/NUM/LessThan across all groups and scenarios for one violation type."""
+    total_wns = 0
+    total_tns = 0.0
+    total_num = 0
+    total_lt  = 0
+    if key in sections:
+        for _, scenarios in sections[key].items():
+            for _, s in scenarios.items():
+                total_wns  = min(total_wns, s['WNS'])
+                total_tns += s['TNS']
+                total_num += s['NUM']
+                total_lt  += s.get('LessThan', 0)
+    return total_wns, total_tns, total_num, total_lt
+
+
+# ═══════════════════════════════════════════════════════════════
+# 7. DataFrame utilities
+# ═══════════════════════════════════════════════════════════════
+def _strip_col_spaces(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove spaces from all string column names."""
+    return df.rename(columns={
+        c: c.strip().replace(' ', '') if isinstance(c, str) else c
+        for c in df.columns
+    })
+
+
+def _strip_list_spaces(lst: list) -> list:
+    return [s.replace(' ', '') for s in lst]
+
+
+def tag_columns_with_date(df: pd.DataFrame, date: str,
+                          exclude: list = []) -> pd.DataFrame:
+    """
+    Append _v{mmdd} suffix to columns not already versioned (pattern _v####),
+    not already a diff column (ending in _diff), and not in exclude list.
+    """
+    df      = _strip_col_spaces(df)
+    exclude = _strip_list_spaces(exclude)
+    mmdd    = date[4:]
+    pat_ver  = re.compile(r'_v\d{4}$')
+    pat_diff = re.compile(r'_diff$')
+    new_cols = {}
+    for col in df.columns:
+        if not isinstance(col, str):
+            new_cols[col] = col
+        elif any(fnmatch.fnmatch(col, p) for p in exclude):
+            new_cols[col] = col
+        elif pat_ver.search(col) or pat_diff.search(col):
+            new_cols[col] = col   # already versioned or already a diff → leave as-is
+        else:
+            new_cols[col] = f"{col}_v{mmdd}"
+    return df.rename(columns=new_cols)
+
+
+def select_columns(df: pd.DataFrame,
+                   include: list = [], exclude: list = []) -> pd.DataFrame:
+    """
+    Filter columns by fnmatch include/exclude patterns.
+    Sets Partition as index, drops duplicate partitions and empty rows.
+    """
+    df = _strip_col_spaces(df)
+    if df.index.name != COL_PARTITION:
+        df = df.set_index(COL_PARTITION, drop=True)
+    df  = df[~df.index.duplicated(keep='first')]
+    inc = _strip_list_spaces(df.columns.tolist() if not include else include)
+    exc = _strip_list_spaces(exclude)
+    cols = [c for c in df.columns if     any(fnmatch.fnmatch(c, p) for p in inc)]
+    cols = [c for c in cols       if not any(fnmatch.fnmatch(c, p) for p in exc)]
+    df   = df[cols].copy()
+    df   = df[~df.index.isna()]
+    df   = df[~(df.index.astype(str).str.strip() == '')]
+    return df
+
+
+def lookup_partitions(df: pd.DataFrame, partitions: list,
+                      cols: list = []) -> pd.DataFrame:
+    """Reindex df to exact partitions list; return specified cols (or all)."""
+    df = _strip_col_spaces(df)
+    if df.index.name != COL_PARTITION:
+        df = df.set_index(COL_PARTITION, drop=True)
+    df       = df[~df.index.duplicated(keep='first')]
+    col_list = _strip_list_spaces(df.columns.tolist() if not cols else cols)
+    return df.reindex(partitions)[col_list]
+
+
+def merge_dataframes(df_list: list, sort_list: list = [],
+                     date_new: str = None, date_old: str = None) -> pd.DataFrame:
+    """
+    Outer-join a list of DataFrames on their index.
+    If sort_list is given, reorder columns: for each base name in sort_list,
+    group columns as [_diff, _v{new}, _v{old}, exact] before any remainder.
+    """
+    if not df_list:
+        return pd.DataFrame()
+    merged = pd.concat(
+        [df if isinstance(df, pd.DataFrame) else pd.DataFrame(df)
+         for df in df_list],
+        axis=1, join='outer'
+    )
+    if sort_list and date_new and date_old:
+        ordered, used = [], set()
+        sfx_new  = date_new[4:]
+        sfx_old  = date_old[4:]
+        for pat in sort_list:
+            # For each base pattern, collect columns in priority order:
+            #   1. {pat}_diff          (exact diff column)
+            #   2. {pat}_v{new}        (new versioned)
+            #   3. {pat}_v{old}        (old versioned)
+            #   4. {pat}               (exact unversioned, e.g. metadata)
+            for suffix in [f'_diff', f'_v{sfx_new}', f'_v{sfx_old}', '']:
+                if suffix == '':
+                    # exact match only — avoid re-matching versioned cols
+                    candidates = [c for c in merged.columns
+                                  if c not in used and str(c) == pat]
+                else:
+                    candidates = [c for c in merged.columns
+                                  if c not in used and str(c) == f"{pat}{suffix}"]
+                ordered.extend(candidates)
+                used.update(candidates)
+        remaining = sorted([c for c in merged.columns if c not in used], reverse=True)
+        merged = merged[ordered + remaining]
+    return merged
+
+
+def compute_diff(df: pd.DataFrame, date_new: str, date_old: str,
+                 cols: list) -> pd.DataFrame:
+    """
+    For each base column name in cols, add a {col}_diff column = new - old.
+    Values may be scalar or 'a / b / c' slash-separated multi-values.
+    """
+    sfx_new = f"_v{date_new[4:]}"
+    sfx_old = f"_v{date_old[4:]}"
+
+    def _parse(val):
+        if pd.isna(val):
+            return None
+        if isinstance(val, (int, float)):
+            return float(val)
+        parts = [p.strip() for p in str(val).split('/') if p.strip()]
+        try:
+            return [float(p) for p in parts]
+        except ValueError:
+            return None
+
+    def _diff_row(row, cn, co):
+        n, o = _parse(row[cn]), _parse(row[co])
+        if n is None or o is None:
+            return pd.NA
+        if isinstance(n, float) and isinstance(o, float):
+            d = n - o
+            return int(d) if d == int(d) else d
+        if isinstance(n, list) and isinstance(o, list) and len(n) == len(o):
+            diffs = [ni - oi for ni, oi in zip(n, o)]
+            return " / ".join(
+                f"{int(d)}" if d == int(d) else f"{d:.4f}" for d in diffs
+            )
+        return pd.NA
+
+    for col in _strip_list_spaces(cols):
+        cn = f"{col}{sfx_new}"
+        co = f"{col}{sfx_old}"
+        if cn in df.columns and co in df.columns:
+            df[f"{col}_diff"] = df.apply(lambda r, cn=cn, co=co: _diff_row(r, cn, co), axis=1)
+    return df
+
+
+def get_date_from_filename(filename: str) -> str:
+    """Extract yyyymmdd from filename. Returns '00000000' if not found."""
+    m = re.search(r'(\d{8})', os.path.basename(filename))
+    return m.group(1) if m else '00000000'
+
+
+# ═══════════════════════════════════════════════════════════════
+# 8. Excel output utilities
+# ═══════════════════════════════════════════════════════════════
+def _apply_header_style(ws):
+    """Yellow background + bold + left-align + vertical-center for header row."""
+    for cell in ws[1]:
+        cell.fill      = FILL_HEADER
+        cell.font      = Font(bold=True)
+        cell.alignment = Alignment(horizontal='left', vertical='center')
+
+
+def _apply_row_colors(ws):
+    """Alternating light-red / light-blue for data rows (row 2+), vertical-center."""
+    for i, row in enumerate(ws.iter_rows(min_row=2, max_row=ws.max_row)):
+        fill = FILL_ROW_EVEN if i % 2 == 0 else FILL_ROW_ODD
+        for cell in row:
+            cell.fill      = fill
+            cell.alignment = Alignment(horizontal='left', vertical='center')
+
+
+def _apply_diff_col_colors(ws):
+    """Dark red/blue for data cells in columns whose header contains '_diff'."""
+    for col in ws.iter_cols(min_row=1, max_row=ws.max_row):
+        hdr = col[0].value
+        if isinstance(hdr, str) and '_diff' in hdr.lower():
+            for i, cell in enumerate(col[1:]):
+                cell.fill = FILL_DIFF_EVEN if i % 2 == 0 else FILL_DIFF_ODD
+
+
+def apply_cell_color_rules(ws, df_out: pd.DataFrame,
+                           rules: List[CellColorRule]):
+    """
+    Apply pluggable CellColorRule list to worksheet.
+    df_out must be the already-reset-index DataFrame (matching Excel column order).
+    """
+    col_indices = {str(col): idx + 1 for idx, col in enumerate(df_out.columns)}
+
+    for rule in rules:
+        matched = [c for c in col_indices if fnmatch.fnmatch(str(c), rule.col_pattern)]
+        for col_name in matched:
+            col_idx = col_indices[col_name]
+            for row_idx in range(2, ws.max_row + 1):
+                cell = ws.cell(row=row_idx, column=col_idx)
+                try:
+                    if rule.condition(cell.value):
+                        if rule.font_color:
+                            cell.font = Font(color=rule.font_color)
+                        if rule.fill_color:
+                            cell.fill = PatternFill(fill_type="solid",
+                                                    fgColor=rule.fill_color)
+                        # preserve vertical-center set by _apply_row_colors
+                        cell.alignment = Alignment(
+                            horizontal=cell.alignment.horizontal or 'left',
+                            vertical='center',
+                            wrap_text=cell.alignment.wrap_text,
+                        )
+                except Exception:
+                    pass  # Skip cells where condition raises (e.g. string vs numeric)
+
+
+def _apply_hidden_columns(ws, hide_patterns: list):
+    """Hide columns matching any fnmatch pattern. Data is preserved."""
+    for col in ws.iter_cols(min_row=1, max_row=1):
+        hdr = col[0].value
+        if isinstance(hdr, str) and any(fnmatch.fnmatch(hdr, p) for p in hide_patterns):
+            ws.column_dimensions[col[0].column_letter].hidden = True
+
+
+def _auto_col_width(ws, max_width: int = 35):
+    """Set column width to content length + padding, capped at max_width."""
+    for col in ws.columns:
+        letter  = col[0].column_letter
+        max_len = max(
+            (len(str(c.value)) for c in col if c.value is not None),
+            default=0
+        )
+        ws.column_dimensions[letter].width = min(max_len + 4, max_width)
+
+
+def _apply_comment_wrap(ws):
+    """
+    Enable wrap_text for Comment columns and auto-adjust row height based on
+    the longest Comment value in each row (15pt per line, min 15pt).
+    openpyxl does not compute row height automatically after wrap_text is set,
+    so we estimate it here.
+    """
+    # Collect (col_index, col_width) for all Comment columns
+    comment_cols: List[tuple] = []
+    for col in ws.iter_cols(min_row=1, max_row=1):
+        hdr = col[0].value
+        if isinstance(hdr, str) and hdr.startswith('Comment'):
+            col_letter = col[0].column_letter
+            col_width  = ws.column_dimensions[col_letter].width or 10
+            comment_cols.append((col[0].column, col_width))
+
+    if not comment_cols:
+        return
+
+    CHAR_PER_LINE = 1.2   # approximate chars per unit of column width
+    LINE_HEIGHT   = 15.0  # points per line
+    MIN_HEIGHT    = 15.0
+
+    for row_idx in range(2, ws.max_row + 1):
+        max_lines = 1
+        for col_idx, col_width in comment_cols:
+            cell = ws.cell(row=row_idx, column=col_idx)
+            cell.alignment = Alignment(
+                horizontal='left', vertical='center', wrap_text=True
+            )
+            val = str(cell.value) if cell.value is not None else ""
+            if not val:
+                continue
+            chars_per_line = max(1, int(col_width * CHAR_PER_LINE))
+            # Count explicit newlines too
+            lines = 0
+            for segment in val.split('\n'):
+                lines += max(1, -(-len(segment) // chars_per_line))  # ceiling div
+            max_lines = max(max_lines, lines)
+
+        ws.row_dimensions[row_idx].height = max(MIN_HEIGHT, max_lines * LINE_HEIGHT)
+
+
+def _write_sheet(writer, df: pd.DataFrame, sheet_name: str,
+                 freeze: str,
+                 color_rules: List[CellColorRule],
+                 hide_patterns: List[str]):
+    """
+    Write df to a new sheet with full styling applied in order:
+      row colors → diff-col colors → header (overrides row 1) →
+      cell rules → timing diff colors → comment wrap →
+      hidden cols → col widths → freeze panes
+    """
+    df_out = df.reset_index()
+    df_out.to_excel(writer, sheet_name=sheet_name, index=False)
+    ws = writer.book[sheet_name]
+    _apply_row_colors(ws)
+    _apply_diff_col_colors(ws)
+    _apply_header_style(ws)          # applied last so header always wins row 1
+    apply_cell_color_rules(ws, df_out, color_rules)
+    _apply_timing_diff_colors(ws, df_out)
+    _apply_hidden_columns(ws, hide_patterns)
+    _auto_col_width(ws)              # must run before _apply_comment_wrap (needs col widths)
+    _apply_comment_wrap(ws)          # wrap + row-height estimation uses col widths
+    ws.freeze_panes = freeze
+
+
+# ═══════════════════════════════════════════════════════════════
+# 9. Mode: --example  (generate config.ods template)
+# ═══════════════════════════════════════════════════════════════
+def mode_example():
+    """Write a sample config.ods that --from expects as input."""
+    check_libreoffice_conflict()
+    out_xlsx = "config_example.xlsx"
+    out_ods  = "config_example.ods"
+
+    sample = pd.DataFrame([
+        {
+            CFG_COL_PARTITION: "partitionA",
+            CFG_COL_BEOWNER:   "owner1",
+            CFG_COL_STA_DIR:   "/path/to/DMSA_output_20260312_120000",
+        },
+        {
+            CFG_COL_PARTITION: "partitionB",
+            CFG_COL_BEOWNER:   "owner2",
+            CFG_COL_STA_DIR:   "/path/to/DMSA_output_20260312_130000",
+        },
+    ])
+
+    with pd.ExcelWriter(out_xlsx, engine='openpyxl') as writer:
+        sample.to_excel(writer, index=False, sheet_name='config')
+        ws = writer.book['config']
+        _apply_header_style(ws)
+        _auto_col_width(ws)
+
+    # Convert to ODS with shared mode enabled
+    convert_to_ods_shared(out_xlsx)
+    print(f"Example config written to: {out_ods}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 10. Mode: --from  (extract)
+# ═══════════════════════════════════════════════════════════════
+def _parse_sta_directory(base_dir: str, partition_name: str,
+                         threshold: float) -> dict:
+    """
+    Parse one STA output directory and collect all timing metrics.
+    Returns a flat dict keyed by column name constants.
+    """
+    # --- defaults ---
+    row = {
+        COL_PARTITION:        partition_name,
+        COL_APR_STAGE:        "NA",
+        COL_SI_NSI:           "NA",
+        COL_SI_PARAMS_ERRORS: "NA",
+        COL_FILE_ADDR:        "",
+        COL_COMMENT:          "",
+    }
+    for cat in PATH_CATEGORIES:
+        row[col_setup(cat)] = "NA"
+        row[col_hold(cat)]  = "NA"
+    row[col_max_trans_vio(threshold)] = "NA"
+    row[COL_MAX_CAP_VIO]              = "NA"
+    row[COL_MIN_PULSE_WIDTH]          = "NA"
+    row[COL_MIN_PERIOD]               = "NA"
+    row[COL_NOISE]                    = "NA"
+    row[COL_DOUBLE_SWITCHING]         = "NA"
+
+    if not os.path.exists(base_dir):
+        logging.error(f"STA directory not found: {base_dir}")
+        return row
+
+    logging.info(f"Parsing partition '{partition_name}': {base_dir}")
+    row[COL_FILE_ADDR] = os.path.realpath(base_dir)
+    scenario_mode, design_stage, si_enable, _ = parse_pt_log(base_dir)
+    row[COL_APR_STAGE] = design_stage
+    # Normalise SI_ENABLE: strip whitespace, case-insensitive → "SI" / "nSI" / "NA"
+    _si = si_enable.strip().lower() if isinstance(si_enable, str) else ""
+    if _si == "true":
+        row[COL_SI_NSI] = "SI"
+    elif _si == "false":
+        row[COL_SI_NSI] = "nSI"
+    else:
+        row[COL_SI_NSI] = "NA"
+
+    reports_dir = Path(base_dir) / 'reports'
+    if not reports_dir.exists():
+        logging.error(f"reports/ subdirectory not found in: {base_dir}")
+        return row
+
+    full_reports_path = str(reports_dir.resolve())
+
+    # ── Setup / Hold ──────────────────────────────────────────
+    timing_files = sorted(
+        p for p in reports_dir.glob('*global_timing.report*')
+        if p.name.endswith('.report') or p.name.endswith('.report.gz')
+    )
+    if timing_files:
+        data = _read_file(str(timing_files[-1]))
+        vio  = parse_violations(data)
+        setup_hdrs, setup_vals = _format_violations(vio["Setup"], "Setup")
+        hold_hdrs,  hold_vals  = _format_violations(vio["Hold"],  "Hold")
+        for h, v in zip(setup_hdrs, setup_vals):
+            row[h] = v
+        for h, v in zip(hold_hdrs, hold_vals):
+            row[h] = v
+    else:
+        logging.error(f"No global_timing.report found in {full_reports_path}")
+
+    # ── PBA violations ────────────────────────────────────────
+    pba_files = sorted(
+        p for p in reports_dir.glob('*PBA_violate.report*')
+        if p.name.endswith('.report') or p.name.endswith('.report.gz')
+    )
+    if pba_files:
+        data = _read_file(str(pba_files[-1]))
+        sections, err = parse_pba_violations(data, threshold, scenario_mode)
+        if err:
+            logging.error(f"Errors detected in PBA report: {pba_files[-1]}")
+        _, _, mt_num, mt_lt = _sum_pba_section(sections, 'max_transition')
+        _, _, mc_num, _     = _sum_pba_section(sections, 'max_capacitance')
+        _, _, mp_num, _     = _sum_pba_section(sections, 'min_period')
+        _, _, mpw_num, _    = _sum_pba_section(sections, 'min_pulse_width')
+        row[col_max_trans_vio(threshold)] = f"{mt_lt}/{mt_num}" if data != "NA" else "NA"
+        row[COL_MAX_CAP_VIO]              = str(mc_num)  if data != "NA" else "NA"
+        row[COL_MIN_PERIOD]               = str(mp_num)  if data != "NA" else "NA"
+        row[COL_MIN_PULSE_WIDTH]          = str(mpw_num) if data != "NA" else "NA"
+    else:
+        logging.error(f"No PBA_violate.report found in {full_reports_path}")
+
+    # ── SI noise ──────────────────────────────────────────────
+    noise_files = sorted(
+        p for p in reports_dir.glob('*report_noise_all_violate.report*')
+        if p.name.endswith('.report') or p.name.endswith('.report.gz')
+    )
+    if noise_files and si_enable == "true":  # si_enable still holds raw value here
+        data = _read_file(str(noise_files[-1]))
+        row[COL_NOISE] = parse_si_noise(data)
+
+        # SI double switching (per-scenario sub-directories)
+        total_ds = 0
+        for sub in reports_dir.iterdir():
+            if not sub.is_dir():
+                continue
+            for ds_file in sub.glob('*report_si_double_switching.report*'):
+                v = parse_si_double_switching(_read_file(str(ds_file)))
+                if v == "NA":
+                    total_ds = "NA"
+                    break
+                total_ds += v
+            if total_ds == "NA":
+                break
+        row[COL_DOUBLE_SWITCHING] = total_ds
+    else:
+        logging.warning(f"SI noise reports not found or SI disabled in {full_reports_path}")
+
+    # ── SI params errors (post-route only) ────────────────────
+    if design_stage == "post-route":
+        work_dir = Path(base_dir) / 'work'
+        if scenario_mode == "single":
+            sub_dirs = [str(base_dir)]
+        elif work_dir.exists():
+            sub_dirs = [str(work_dir / d)
+                        for d in os.listdir(work_dir)
+                        if (work_dir / d).is_dir()]
+        else:
+            sub_dirs = []
+        total_err = 0
+        for sub in sub_dirs:
+            for pf in glob.glob(os.path.join(sub, '*parasitics_command.log*')):
+                v = parse_si_params(_read_file(pf))
+                if v == "NA":
+                    total_err = "NA"
+                    break
+                total_err += v
+            if total_err == "NA":
+                break
+        row[COL_SI_PARAMS_ERRORS] = total_err
+
+    na_fields = [k for k, v in row.items() if v == "NA"]
+    if na_fields:
+        logging.warning(f"  [{partition_name}] NA fields: {', '.join(na_fields)}")
+    else:
+        logging.info(f"  [{partition_name}] OK — all fields parsed")
+    return row
+
+
+def mode_extract(config_file: str, threshold: float, output_ods: bool):
+    """
+    Extract mode: read config (xlsx/ods), parse each STA directory,
+    write Partition_Timing_Status_<timestamp>.xlsx (or .ods).
+    """
+    # FIX: specify sheet_name=0 to always get a DataFrame, not a dict
+    cfg_df = read_xlsx_ods(config_file, sheet_name=0)
+    cfg_df.columns = [c.strip() for c in cfg_df.columns]
+
+    rows = []
+    total = sum(
+        1 for _, r in cfg_df.iterrows()
+        if str(r.get(CFG_COL_PARTITION, "")).strip()
+    )
+    # Columns to check for NA (exclude free-text / path fields)
+    _na_check_exclude = {COL_FILE_ADDR, COL_COMMENT, COL_BEOWNER}
+
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        console=_console,
+        transient=False,
+    ) as progress:
+        task = progress.add_task("Parsing", total=total)
+        for _, cfg_row in cfg_df.iterrows():
+            partition = str(cfg_row.get(CFG_COL_PARTITION, "")).strip()
+            beowner   = str(cfg_row.get(CFG_COL_BEOWNER,   "")).strip()
+            sta_dir   = str(cfg_row.get(CFG_COL_STA_DIR,   "")).strip()
+            if not partition:
+                continue
+            metrics = _parse_sta_directory(sta_dir, partition, threshold)
+            metrics[COL_BEOWNER] = beowner
+            rows.append(metrics)
+            progress.advance(task)
+
+            na_fields = [
+                k for k, v in metrics.items()
+                if v == "NA" and k not in _na_check_exclude
+            ]
+            if na_fields:
+                _console.print(
+                    f"  [red]✗[/red] {partition} — NA: {', '.join(na_fields)}"
+                )
+            else:
+                _console.print(f"  [green]✓[/green] {partition}")
+
+    if not rows:
+        print(f"{COLOR_R}Error: No valid partitions found in config.{NO_COLOR}")
+        sys.exit(1)
+
+    df = pd.DataFrame(rows).set_index(COL_PARTITION)
+
+    # Enforce column order
+    fixed   = [COL_BEOWNER, COL_APR_STAGE, COL_SI_NSI, COL_COMMENT, COL_SI_PARAMS_ERRORS]
+    setup   = [col_setup(c) for c in PATH_CATEGORIES]
+    hold    = [col_hold(c)  for c in PATH_CATEGORIES]
+    other   = [col_max_trans_vio(threshold), COL_MAX_CAP_VIO,
+               COL_MIN_PULSE_WIDTH, COL_MIN_PERIOD,
+               COL_NOISE, COL_DOUBLE_SWITCHING, COL_FILE_ADDR]
+    ordered = [c for c in (fixed + setup + hold + other) if c in df.columns]
+    extra   = [c for c in df.columns if c not in ordered]
+    df      = df[ordered + extra]
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_xlsx  = f"Partition_Timing_Status_{timestamp}.xlsx"
+
+    with pd.ExcelWriter(out_xlsx, engine='openpyxl') as writer:
+        _write_sheet(writer, df,
+                     sheet_name    = 'Overall',
+                     freeze        = 'E2',
+                     color_rules   = EXTRACT_COLOR_RULES,
+                     hide_patterns = EXTRACT_HIDE_DEFAULT)
+
+    # Remove stale symlinks
+    for ext in ('xlsx', 'ods'):
+        link = f"Partition_Timing_Status_current.{ext}"
+        if os.path.exists(link) or os.path.islink(link):
+            os.remove(link)
+
+    if output_ods:
+        ods_path = convert_to_ods_shared(out_xlsx, freeze='E2', sheet_name='Overall')
+        os.symlink(ods_path, "Partition_Timing_Status_current.ods")
+    else:
+        print(f"Output written to: {out_xlsx}")
+        os.symlink(out_xlsx, "Partition_Timing_Status_current.xlsx")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 11. Mode: --diff
+# ═══════════════════════════════════════════════════════════════
+def mode_diff(file_old: str, file_new: str, output_ods: bool):
+    """
+    Diff mode: load two Partition_Timing_Status files, compute column-wise
+    differences, and write Partition_Timing_Status_<date_new>_Diff.xlsx/ods.
+    """
+    date_old = get_date_from_filename(file_old)
+    date_new = get_date_from_filename(file_new)
+
+    df_old = read_xlsx_ods(file_old, sheet_name='Overall')
+    df_new = read_xlsx_ods(file_new, sheet_name='Overall')
+
+    partitions = df_new[COL_PARTITION].dropna().tolist()
+
+    # Columns that carry metadata — do NOT get date-versioned
+    exclude_from_date = [COL_PARTITION, COL_BEOWNER, COL_APR_STAGE, COL_SI_NSI]
+
+    df_old_v = tag_columns_with_date(df_old, date_old, exclude=exclude_from_date)
+    df_new_v = tag_columns_with_date(df_new, date_new, exclude=exclude_from_date)
+
+    # Patterns to pull from each versioned frame
+    keep_patterns = [
+        'Comment*', f'{COL_SI_PARAMS_ERRORS}*',
+        'Setup*', 'Hold*',
+        'MaxTransVio*', f'{COL_MAX_CAP_VIO}*',
+        f'{COL_MIN_PULSE_WIDTH}*', f'{COL_MIN_PERIOD}*',
+        f'{COL_NOISE}*', f'{COL_DOUBLE_SWITCHING}*',
+    ]
+    df_old_v = select_columns(df_old_v, include=keep_patterns, exclude=['*_diff*', '*_diff'])
+    df_new_v = select_columns(df_new_v, include=keep_patterns, exclude=['*_diff*', '*_diff'])
+
+    df_head     = lookup_partitions(df_new, partitions,
+                                    cols=[COL_BEOWNER, COL_APR_STAGE, COL_SI_NSI])
+    df_from_old = lookup_partitions(df_old_v, partitions)
+    df_from_new = lookup_partitions(df_new_v, partitions)
+
+    # Base column names for diff computation
+    base_diff_cols = [
+        COL_SI_PARAMS_ERRORS,
+        col_setup("Total"), col_setup("REG2REG"), col_setup("IN2REG"),
+        col_setup("REG2OUT"), col_setup("IN2OUT"),
+        col_hold("Total"),  col_hold("REG2REG"),  col_hold("IN2REG"),
+        col_hold("REG2OUT"), col_hold("IN2OUT"),
+        COL_MAX_CAP_VIO, COL_MIN_PULSE_WIDTH, COL_MIN_PERIOD,
+        COL_NOISE, COL_DOUBLE_SWITCHING,
+    ]
+    # MaxTransVio column name is dynamic (depends on threshold used at extract time)
+    # Discover it from the new file's columns by pattern
+    max_trans_bases = list({
+        re.sub(r'_v\d{4}$', '', c)
+        for c in df_from_new.columns
+        if 'MaxTransVio' in c
+    })
+    diff_cols = list(dict.fromkeys(base_diff_cols + max_trans_bases))
+
+    sort_list = [
+        COL_PARTITION, COL_BEOWNER, COL_APR_STAGE, COL_SI_NSI, COL_COMMENT
+    ] + diff_cols
+
+    df_merged = merge_dataframes([df_head, df_from_old, df_from_new])
+    df_diff   = compute_diff(df_merged, date_new=date_new, date_old=date_old,
+                             cols=diff_cols)
+    df_diff   = merge_dataframes([df_diff], sort_list=sort_list,
+                                 date_new=date_new, date_old=date_old)
+
+    # Any columns that are neither metadata, diff, nor versioned data → hide
+    meta_subs = [COL_PARTITION, 'BEOwner', 'APRStage', 'SI/nSI', 'Comment']
+    extra_hide = [
+        c for c in df_diff.columns
+        if not any(sub in str(c) for sub in
+                   meta_subs + ['_diff', date_new[4:], date_old[4:]])
+    ]
+
+    out_xlsx = f"Partition_Timing_Status_{date_new}_Diff.xlsx"
+    with pd.ExcelWriter(out_xlsx, engine='openpyxl') as writer:
+        _write_sheet(writer, df_diff,
+                     sheet_name    = 'Overall',
+                     freeze        = 'E2',
+                     color_rules   = DIFF_COLOR_RULES,
+                     hide_patterns = DIFF_HIDE_DEFAULT + extra_hide)
+
+    # Remove stale diff symlinks
+    for ext in ('xlsx', 'ods'):
+        link = f"Partition_Timing_Status_diff.{ext}"
+        if os.path.exists(link) or os.path.islink(link):
+            os.remove(link)
+
+    if output_ods:
+        ods_path = convert_to_ods_shared(out_xlsx, freeze='E2', sheet_name='Overall')
+        os.symlink(ods_path, "Partition_Timing_Status_diff.ods")
+    else:
+        print(f"Diff output written to: {out_xlsx}")
+        os.symlink(out_xlsx, "Partition_Timing_Status_diff.xlsx")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 12. Entry point
+# ═══════════════════════════════════════════════════════════════
+if __name__ == '__main__':
+    logging.basicConfig(
+        filename='partition_timing_status.log',
+        filemode='w', level=logging.DEBUG,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    )
+
+    parser = argparse.ArgumentParser(
+        description='Partition Timing Status — extract STA results, diff two reports, '
+                    'or generate a config template.',
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+
+    mode_group = parser.add_mutually_exclusive_group(required=True)
+    mode_group.add_argument(
+        '--from', dest='config', metavar='CONFIG',
+        help='Extract mode: path to config.ods / config.xlsx'
+    )
+    mode_group.add_argument(
+        '--diff', action='store_true',
+        help='Diff mode: compare two Partition_Timing_Status files\n'
+             '  requires --old and --new'
+    )
+    mode_group.add_argument(
+        '--example', action='store_true',
+        help='Generate a sample config.ods template and exit'
+    )
+
+    parser.add_argument('--old', metavar='FILE',
+                        help='Older timing status file (diff mode)')
+    parser.add_argument('--new', metavar='FILE',
+                        help='Newer timing status file (diff mode)')
+    parser.add_argument(
+        '--max-trans', dest='max_trans', type=float, default=-0.1,
+        metavar='VALUE',
+        help='Max-trans slack threshold for violation count (default: -0.1)'
+    )
+    parser.add_argument(
+        '--output-ods', dest='output_ods', action='store_true',
+        help='Convert output to ODS format with shared edit mode enabled'
+    )
+
+    args = parser.parse_args()
+
+    # ── Validate diff mode ─────────────────────────────────────
+    if args.diff:
+        if not args.old or not args.new:
+            parser.error("--diff requires both --old and --new")
+        name_pattern = r'^Partition_Timing_Status_\d{8}.*\.(ods|xlsx)$'
+        for flag, path in [('--old', args.old), ('--new', args.new)]:
+            if not re.match(name_pattern, os.path.basename(path)):
+                print(f"{COLOR_R}Error: {flag} filename must match "
+                      f"Partition_Timing_Status_<yyyymmdd>*.(xlsx|ods){NO_COLOR}")
+                sys.exit(1)
+            if not os.path.isfile(path):
+                print(f"{COLOR_R}Error: {flag} file not found: {path}{NO_COLOR}")
+                sys.exit(1)
+        if get_date_from_filename(args.old) == get_date_from_filename(args.new):
+            print(f"{COLOR_R}Error: --old and --new files share the same date{NO_COLOR}")
+            sys.exit(1)
+
+    # ── LibreOffice conflict check (only when soffice will be invoked) ──
+    needs_soffice = (
+        args.output_ods
+        or args.example
+        or (args.config and os.path.splitext(args.config)[1].lower() == '.ods')
+        or (args.diff and (
+            (args.old and os.path.splitext(args.old)[1].lower() == '.ods') or
+            (args.new and os.path.splitext(args.new)[1].lower() == '.ods')
+        ))
+    )
+    if needs_soffice:
+        check_libreoffice_conflict()
+
+    # ── Dispatch ───────────────────────────────────────────────
+    try:
+        if args.example:
+            mode_example()
+        elif args.diff:
+            mode_diff(args.old, args.new, args.output_ods)
+        else:
+            mode_extract(args.config, args.max_trans, args.output_ods)
+    except KeyboardInterrupt:
+        print(f"\n{COLOR_Y}Interrupted by user.{NO_COLOR}")
+        sys.exit(130)  # Unix convention: 128 + SIGINT
