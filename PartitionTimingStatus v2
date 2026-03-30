@@ -29,6 +29,10 @@ import pandas as pd
 import openpyxl
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, MofNCompleteColumn
+
+_console = Console()
 
 __VERSION__ = 2.0
 
@@ -130,6 +134,84 @@ DIFF_COLOR_RULES: List[CellColorRule] = [
     ),
     # Future: flag regressions beyond threshold, etc.
 ]
+
+
+def _timing_diff_font_color(raw) -> Optional[str]:
+    """
+    Determine font color for a Setup(*) / Hold(*) _diff cell.
+    Cell value is a scalar (NVP-only diff) or 'WNS_diff / TNS_diff / NVP_diff'.
+
+    Per-token improvement direction:
+      index 0 (WNS) : > 0 is good (improved)
+      index 1 (TNS) : > 0 is good (improved)
+      index 2 (NVP) : < 0 is good (fewer violations)
+
+    Overall cell color (most conservative):
+      - Any token violates its rule → red  "FF0000"
+      - All tokens improved         → green "00AA00"
+      - All tokens = 0              → black (None)
+      - NA / err / non-numeric      → black (None)
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        # scalar: treat as WNS-style (positive = improved)
+        v = float(raw)
+        if v < 0:
+            return "FF0000"
+        if v > 0:
+            return "00AA00"
+        return None
+
+    parts = [p.strip() for p in str(raw).split('/')]
+    try:
+        tokens = [float(p) for p in parts]
+    except ValueError:
+        return None  # non-numeric (NA, err) → black
+
+    # Map token index → True if "positive direction is good"
+    # index 0=WNS, 1=TNS: higher is better; index 2=NVP: lower is better
+    def _is_bad(idx: int, val: float) -> bool:
+        if idx == 2:          # NVP: violation when > 0
+            return val > 0
+        else:                 # WNS/TNS: violation when < 0
+            return val < 0
+
+    def _is_good(idx: int, val: float) -> bool:
+        if idx == 2:
+            return val < 0
+        else:
+            return val > 0
+
+    if any(_is_bad(i, t) for i, t in enumerate(tokens)):
+        return "FF0000"
+    if all(_is_good(i, t) for i, t in enumerate(tokens)):
+        return "00AA00"
+    return None  # all zero or mixed zero/good → black
+
+
+def _apply_timing_diff_colors(ws, df_out: pd.DataFrame):
+    """
+    Apply red/green/black font to Setup(*) and Hold(*) _diff columns.
+    Must run after _apply_row_colors so fill is already set.
+    """
+    timing_diff_cols = {
+        str(col): idx + 1
+        for idx, col in enumerate(df_out.columns)
+        if isinstance(col, str) and '_diff' in col and
+           (col.startswith('Setup(') or col.startswith('Hold('))
+    }
+    for col_name, col_idx in timing_diff_cols.items():
+        for row_idx in range(2, ws.max_row + 1):
+            cell  = ws.cell(row=row_idx, column=col_idx)
+            color = _timing_diff_font_color(cell.value)
+            if color:
+                cell.font = Font(color=color)
+                cell.alignment = Alignment(
+                    horizontal=cell.alignment.horizontal or 'left',
+                    vertical='center',
+                    wrap_text=cell.alignment.wrap_text,
+                )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -530,23 +612,24 @@ def _strip_list_spaces(lst: list) -> list:
 def tag_columns_with_date(df: pd.DataFrame, date: str,
                           exclude: list = []) -> pd.DataFrame:
     """
-    Append _v{mmdd} suffix to columns not already versioned (pattern _v####)
-    and not in exclude list (fnmatch patterns).
+    Append _v{mmdd} suffix to columns not already versioned (pattern _v####),
+    not already a diff column (ending in _diff), and not in exclude list.
     """
     df      = _strip_col_spaces(df)
     exclude = _strip_list_spaces(exclude)
     mmdd    = date[4:]
-    pat_ver = re.compile(r'_v\d{4}$')
+    pat_ver  = re.compile(r'_v\d{4}$')
+    pat_diff = re.compile(r'_diff$')
     new_cols = {}
     for col in df.columns:
         if not isinstance(col, str):
             new_cols[col] = col
         elif any(fnmatch.fnmatch(col, p) for p in exclude):
             new_cols[col] = col
-        elif not pat_ver.search(col):
-            new_cols[col] = f"{col}_v{mmdd}"
+        elif pat_ver.search(col) or pat_diff.search(col):
+            new_cols[col] = col   # already versioned or already a diff → leave as-is
         else:
-            new_cols[col] = col
+            new_cols[col] = f"{col}_v{mmdd}"
     return df.rename(columns=new_cols)
 
 
@@ -597,15 +680,24 @@ def merge_dataframes(df_list: list, sort_list: list = [],
     )
     if sort_list and date_new and date_old:
         ordered, used = [], set()
+        sfx_new  = date_new[4:]
+        sfx_old  = date_old[4:]
         for pat in sort_list:
-            for suffix in ['_diff', date_new[4:], date_old[4:], '']:
-                matches = [
-                    c for c in merged.columns
-                    if c not in used and fnmatch.fnmatch(str(c), f"{pat}*{suffix}")
-                ]
-                matches.sort(reverse=True)
-                ordered.extend(matches)
-                used.update(matches)
+            # For each base pattern, collect columns in priority order:
+            #   1. {pat}_diff          (exact diff column)
+            #   2. {pat}_v{new}        (new versioned)
+            #   3. {pat}_v{old}        (old versioned)
+            #   4. {pat}               (exact unversioned, e.g. metadata)
+            for suffix in [f'_diff', f'_v{sfx_new}', f'_v{sfx_old}', '']:
+                if suffix == '':
+                    # exact match only — avoid re-matching versioned cols
+                    candidates = [c for c in merged.columns
+                                  if c not in used and str(c) == pat]
+                else:
+                    candidates = [c for c in merged.columns
+                                  if c not in used and str(c) == f"{pat}{suffix}"]
+                ordered.extend(candidates)
+                used.update(candidates)
         remaining = sorted([c for c in merged.columns if c not in used], reverse=True)
         merged = merged[ordered + remaining]
     return merged
@@ -663,20 +755,20 @@ def get_date_from_filename(filename: str) -> str:
 # 8. Excel output utilities
 # ═══════════════════════════════════════════════════════════════
 def _apply_header_style(ws):
-    """Yellow background + bold + left-align for header row."""
+    """Yellow background + bold + left-align + vertical-center for header row."""
     for cell in ws[1]:
         cell.fill      = FILL_HEADER
         cell.font      = Font(bold=True)
-        cell.alignment = Alignment(horizontal='left')
+        cell.alignment = Alignment(horizontal='left', vertical='center')
 
 
 def _apply_row_colors(ws):
-    """Alternating light-red / light-blue for data rows (row 2+)."""
+    """Alternating light-red / light-blue for data rows (row 2+), vertical-center."""
     for i, row in enumerate(ws.iter_rows(min_row=2, max_row=ws.max_row)):
         fill = FILL_ROW_EVEN if i % 2 == 0 else FILL_ROW_ODD
         for cell in row:
             cell.fill      = fill
-            cell.alignment = Alignment(horizontal='left')
+            cell.alignment = Alignment(horizontal='left', vertical='center')
 
 
 def _apply_diff_col_colors(ws):
@@ -709,6 +801,12 @@ def apply_cell_color_rules(ws, df_out: pd.DataFrame,
                         if rule.fill_color:
                             cell.fill = PatternFill(fill_type="solid",
                                                     fgColor=rule.fill_color)
+                        # preserve vertical-center set by _apply_row_colors
+                        cell.alignment = Alignment(
+                            horizontal=cell.alignment.horizontal or 'left',
+                            vertical='center',
+                            wrap_text=cell.alignment.wrap_text,
+                        )
                 except Exception:
                     pass  # Skip cells where condition raises (e.g. string vs numeric)
 
@@ -732,6 +830,17 @@ def _auto_col_width(ws, max_width: int = 35):
         ws.column_dimensions[letter].width = min(max_len + 4, max_width)
 
 
+def _apply_comment_wrap(ws):
+    """Enable wrap_text for all columns whose header starts with 'Comment'."""
+    for col in ws.iter_cols(min_row=1, max_row=ws.max_row):
+        hdr = col[0].value
+        if isinstance(hdr, str) and hdr.startswith('Comment'):
+            for cell in col[1:]:
+                cell.alignment = Alignment(
+                    horizontal='left', vertical='center', wrap_text=True
+                )
+
+
 def _write_sheet(writer, df: pd.DataFrame, sheet_name: str,
                  freeze: str,
                  color_rules: List[CellColorRule],
@@ -739,7 +848,8 @@ def _write_sheet(writer, df: pd.DataFrame, sheet_name: str,
     """
     Write df to a new sheet with full styling applied in order:
       row colors → diff-col colors → header (overrides row 1) →
-      cell rules → hidden cols → col widths → freeze panes
+      cell rules → timing diff colors → comment wrap →
+      hidden cols → col widths → freeze panes
     """
     df_out = df.reset_index()
     df_out.to_excel(writer, sheet_name=sheet_name, index=False)
@@ -748,6 +858,8 @@ def _write_sheet(writer, df: pd.DataFrame, sheet_name: str,
     _apply_diff_col_colors(ws)
     _apply_header_style(ws)          # applied last so header always wins row 1
     apply_cell_color_rules(ws, df_out, color_rules)
+    _apply_timing_diff_colors(ws, df_out)
+    _apply_comment_wrap(ws)
     _apply_hidden_columns(ws, hide_patterns)
     _auto_col_width(ws)
     ws.freeze_panes = freeze
@@ -930,15 +1042,31 @@ def mode_extract(config_file: str, threshold: float, output_ods: bool):
     cfg_df.columns = [c.strip() for c in cfg_df.columns]
 
     rows = []
-    for _, cfg_row in cfg_df.iterrows():
-        partition = str(cfg_row.get(CFG_COL_PARTITION, "")).strip()
-        beowner   = str(cfg_row.get(CFG_COL_BEOWNER,   "")).strip()
-        sta_dir   = str(cfg_row.get(CFG_COL_STA_DIR,   "")).strip()
-        if not partition:
-            continue
-        metrics = _parse_sta_directory(sta_dir, partition, threshold)
-        metrics[COL_BEOWNER] = beowner
-        rows.append(metrics)
+    total = sum(
+        1 for _, r in cfg_df.iterrows()
+        if str(r.get(CFG_COL_PARTITION, "")).strip()
+    )
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        console=_console,
+        transient=False,
+    ) as progress:
+        task = progress.add_task("Parsing partitions...", total=total)
+        for _, cfg_row in cfg_df.iterrows():
+            partition = str(cfg_row.get(CFG_COL_PARTITION, "")).strip()
+            beowner   = str(cfg_row.get(CFG_COL_BEOWNER,   "")).strip()
+            sta_dir   = str(cfg_row.get(CFG_COL_STA_DIR,   "")).strip()
+            if not partition:
+                continue
+            progress.update(task, description=f"Parsing [cyan]{partition}[/cyan]")
+            metrics = _parse_sta_directory(sta_dir, partition, threshold)
+            metrics[COL_BEOWNER] = beowner
+            rows.append(metrics)
+            progress.advance(task)
+            _console.print(f"  [green]✓[/green] {partition}")
 
     if not rows:
         print(f"{COLOR_R}Error: No valid partitions found in config.{NO_COLOR}")
@@ -1155,9 +1283,13 @@ if __name__ == '__main__':
         check_libreoffice_conflict()
 
     # ── Dispatch ───────────────────────────────────────────────
-    if args.example:
-        mode_example()
-    elif args.diff:
-        mode_diff(args.old, args.new, args.output_ods)
-    else:
-        mode_extract(args.config, args.max_trans, args.output_ods)
+    try:
+        if args.example:
+            mode_example()
+        elif args.diff:
+            mode_diff(args.old, args.new, args.output_ods)
+        else:
+            mode_extract(args.config, args.max_trans, args.output_ods)
+    except KeyboardInterrupt:
+        print(f"\n{COLOR_Y}Interrupted by user.{NO_COLOR}")
+        sys.exit(130)  # Unix convention: 128 + SIGINT
