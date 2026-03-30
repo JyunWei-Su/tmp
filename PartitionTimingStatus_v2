@@ -831,23 +831,25 @@ def _normalize_legacy_columns(df: pd.DataFrame) -> pd.DataFrame:
     Detect and rename legacy column names (Partition_Timing_Status v1 /
     diff_partition_timing_status) to v2 CamelCase convention.
 
-    Must be called right after reading a file so downstream processing
-    sees consistent names regardless of which tool generated the file.
+    Handles both plain columns (from extract files) and versioned columns
+    (from diff files, e.g. 'doubleswitching_v0101' → 'DoubleSwitching_v0101').
 
-    Old (after space-strip) → New v2
-      APRstage                           → APRStage
-      Max_transvio.(lessthanX/total)     → MaxTransVio(lt{abs(X)}/Total)
-      Max_capvio.                        → MaxCapVio
-      min_pulse_width                    → MinPulseWidth
-      min_period                         → MinPeriod
-      noise                              → Noise
-      doubleswitching                    → DoubleSwitching
+    Old base name (after space-strip) → New v2 base name
+      APRstage                       → APRStage
+      Max_transvio.(lessthanX/total) → MaxTransVio(lt{abs(X)}/Total)
+      Max_capvio.                    → MaxCapVio
+      min_pulse_width                → MinPulseWidth
+      min_period                     → MinPeriod
+      noise                          → Noise
+      doubleswitching                → DoubleSwitching
     """
     df = _strip_col_spaces(df)   # normalise spaces first
 
     _pat_max_trans = re.compile(
         r'^Max_transvio\.\(lessthan(-?[\d.]+)/total\)$', re.IGNORECASE
     )
+    _pat_ver_suffix = re.compile(r'^(.+?)(_v\d{4})$')
+
     _STATIC: dict = {
         'APRstage':        COL_APR_STAGE,
         'Max_capvio.':     COL_MAX_CAP_VIO,
@@ -857,19 +859,30 @@ def _normalize_legacy_columns(df: pd.DataFrame) -> pd.DataFrame:
         'doubleswitching': COL_DOUBLE_SWITCHING,
     }
 
+    def _norm_base(base: str) -> str:
+        m = _pat_max_trans.match(base)
+        if m:
+            try:
+                val = abs(float(m.group(1)))
+                return f"MaxTransVio(lt{val:g}/Total)"
+            except ValueError:
+                pass
+        return _STATIC.get(base, base)
+
     rename_map: dict = {}
     for col in df.columns:
         if not isinstance(col, str):
             continue
-        m = _pat_max_trans.match(col)
-        if m:
-            try:
-                val = abs(float(m.group(1)))
-                rename_map[col] = f"MaxTransVio(lt{val:g}/Total)"
-            except ValueError:
-                pass
-        elif col in _STATIC and _STATIC[col] != col:
-            rename_map[col] = _STATIC[col]
+        vm = _pat_ver_suffix.match(col)
+        if vm:
+            base, ver = vm.group(1), vm.group(2)
+            new_base = _norm_base(base)
+            if new_base != base:
+                rename_map[col] = f"{new_base}{ver}"
+        else:
+            new_name = _norm_base(col)
+            if new_name != col:
+                rename_map[col] = new_name
 
     if rename_map:
         _console.print(
@@ -1388,13 +1401,13 @@ def mode_diff(file_old: str, file_new: str, output_ods: bool):
     df_old = read_xlsx_ods(file_old, sheet_name='Overall')
     df_new = read_xlsx_ods(file_new, sheet_name='Overall')
 
-    # Drop _diff and already-versioned (_v{mmdd}) columns immediately after reading,
-    # so that a previously diff-ed file can be safely used as --old / --new input.
-    # Reference: diff_partition_timing_status uses exclude_list=['*Diff*', '*diff*']
-    # in df_filter_colnums; here we also strip _v{mmdd} to avoid stale version columns.
-    _stale_col = re.compile(r'(_v\d{4}|_diff)$', re.IGNORECASE)
+    # Drop only _diff columns — they will be recomputed.
+    # _v{mmdd} versioned columns are intentionally kept: when --old/--new is itself
+    # a previously diff-ed file, those versioned columns ARE the data we need.
+    # tag_columns_with_date already skips columns that are already versioned.
+    _stale_diff = re.compile(r'_diff$', re.IGNORECASE)
     for _df in (df_old, df_new):
-        _drop = [c for c in _df.columns if isinstance(c, str) and _stale_col.search(c)]
+        _drop = [c for c in _df.columns if isinstance(c, str) and _stale_diff.search(c)]
         if _drop:
             _df.drop(columns=_drop, inplace=True)
 
