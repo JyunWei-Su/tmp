@@ -302,19 +302,16 @@ def _freeze_cell_to_col_row(freeze: str) -> tuple:
     return col, int(row_str) - 1  # 0-based
 
 
-def _build_freeze_view_xml(sheet_name: str, col: int, row: int) -> str:
+def _build_views_xml(sheet_name: str, col: int, row: int) -> str:
     """
-    Build the ooo:view-settings XML block for settings.xml that encodes
-    freeze panes for a single sheet.
+    Build the config:config-item-map-indexed block for the Views entry
+    that encodes freeze panes. This is injected *inside* the existing
+    ooo:view-settings config-item-set in settings.xml.
 
-    col, row are 0-based split positions (e.g. E2 → col=4, row=1).
-    SplitMode=2 means freeze (not split).
-    ActiveSplitRange=3 means bottom-right pane is active.
+    col, row are 0-based (e.g. E2 → col=5, row=1).
+    HorizontalSplitMode / VerticalSplitMode = 2 means freeze.
     """
-    if col == 0 and row == 0:
-        return ""
     return (
-        '<config:config-item-set config:name="ooo:view-settings">'
         '<config:config-item-map-indexed config:name="Views">'
         '<config:config-item-map-entry>'
         '<config:config-item config:name="ViewId" config:type="string">view1</config:config-item>'
@@ -335,7 +332,6 @@ def _build_freeze_view_xml(sheet_name: str, col: int, row: int) -> str:
         '</config:config-item-map-named>'
         '</config:config-item-map-entry>'
         '</config:config-item-map-indexed>'
-        '</config:config-item-set>'
     )
 
 
@@ -344,12 +340,12 @@ def _patch_ods_shared_mode(ods_path: str, freeze: str = 'E2',
     """
     Patch ODS zip archive to:
       1. Set IsDocumentShared = true
-      2. Inject freeze-pane view-settings (lost during soffice conversion)
+      2. Inject freeze-pane Views block inside the existing ooo:view-settings
+         (soffice conversion produces the set but omits the Views/Tables entries)
     Rebuilds the zip with mimetype stored uncompressed (ODS spec requirement).
     """
     try:
         col, row = _freeze_cell_to_col_row(freeze)
-        freeze_xml = _build_freeze_view_xml(sheet_name, col, row)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             with zipfile.ZipFile(ods_path, 'r') as zr:
@@ -359,21 +355,25 @@ def _patch_ods_shared_mode(ods_path: str, freeze: str = 'E2',
                 with open(settings_path, 'r', encoding='utf-8') as f:
                     content = f.read()
 
-                # 1. Patch IsDocumentShared
+                # 1. Patch IsDocumentShared false → true
                 patched = re.sub(
                     r'(<config:config-item\s+config:name="IsDocumentShared"'
                     r'\s+config:type="boolean">)false(</config:config-item>)',
                     r'\1true\2',
                     content)
 
-                # 2. Inject freeze view-settings
-                #    soffice produces no ooo:view-settings block at all;
-                #    insert it just before </office:settings>
-                if freeze_xml and 'ooo:view-settings' not in patched:
-                    patched = patched.replace(
-                        '</office:settings>',
-                        freeze_xml + '</office:settings>'
-                    )
+                # 2. Inject Views block inside the ooo:view-settings config-item-set.
+                #    soffice always produces this set but never includes Views/Tables,
+                #    so freeze is lost. We insert the Views block just before the
+                #    first </config:config-item-set> that closes ooo:view-settings.
+                VIEW_SET_MARKER = 'config:name="ooo:view-settings"'
+                CLOSE_TAG       = '</config:config-item-set>'
+                if (col or row) and VIEW_SET_MARKER in patched \
+                        and 'config:name="Views"' not in patched:
+                    views_xml  = _build_views_xml(sheet_name, col, row)
+                    insert_at  = patched.index(CLOSE_TAG,
+                                               patched.index(VIEW_SET_MARKER))
+                    patched    = patched[:insert_at] + views_xml + patched[insert_at:]
 
                 with open(settings_path, 'w', encoding='utf-8') as f:
                     f.write(patched)
