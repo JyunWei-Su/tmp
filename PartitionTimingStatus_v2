@@ -878,7 +878,7 @@ def _normalize_legacy_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     Old base name (after space-strip) → New v2 base name
       APRstage                       → APRStage
-      Max_transvio.(lessthanX/total) → MaxTransVio(lt{abs(X)}/Total)
+      Max_transvio.(lessthanX/total) → MaxTransVio(lt{X}/Total)  (sign preserved)
       Max_capvio.                    → MaxCapVio
       min_pulse_width                → MinPulseWidth
       min_period                     → MinPeriod
@@ -905,7 +905,7 @@ def _normalize_legacy_columns(df: pd.DataFrame) -> pd.DataFrame:
         m = _pat_max_trans.match(base)
         if m:
             try:
-                val = abs(float(m.group(1)))
+                val = float(m.group(1))   # preserve sign to match v2 col name
                 return f"MaxTransVio(lt{val:g}/Total)"
             except ValueError:
                 pass
