@@ -284,12 +284,73 @@ def read_xlsx_ods(filename: str, sheet_name=0) -> pd.DataFrame:
         raise ValueError(f"Unsupported file extension: {ext}")
 
 
-def _patch_ods_shared_mode(ods_path: str):
+def _freeze_cell_to_col_row(freeze: str) -> tuple:
     """
-    Patch ODS zip archive to set IsDocumentShared = true in settings.xml.
+    Convert openpyxl freeze_panes string (e.g. 'E2') to
+    0-based (col_index, row_index) for ODS settings.xml.
+    Returns (0, 0) if freeze is None/empty.
+    """
+    if not freeze:
+        return 0, 0
+    m = re.match(r'^([A-Z]+)(\d+)$', freeze.strip().upper())
+    if not m:
+        return 0, 0
+    col_str, row_str = m.group(1), m.group(2)
+    col = 0
+    for ch in col_str:
+        col = col * 26 + (ord(ch) - ord('A') + 1)
+    return col, int(row_str) - 1  # 0-based
+
+
+def _build_freeze_view_xml(sheet_name: str, col: int, row: int) -> str:
+    """
+    Build the ooo:view-settings XML block for settings.xml that encodes
+    freeze panes for a single sheet.
+
+    col, row are 0-based split positions (e.g. E2 → col=4, row=1).
+    SplitMode=2 means freeze (not split).
+    ActiveSplitRange=3 means bottom-right pane is active.
+    """
+    if col == 0 and row == 0:
+        return ""
+    return (
+        '<config:config-item-set config:name="ooo:view-settings">'
+        '<config:config-item-map-indexed config:name="Views">'
+        '<config:config-item-map-entry>'
+        '<config:config-item config:name="ViewId" config:type="string">view1</config:config-item>'
+        '<config:config-item-map-named config:name="Tables">'
+        f'<config:config-item-map-entry config:name="{sheet_name}">'
+        f'<config:config-item config:name="HorizontalSplitMode" config:type="short">{2 if col else 0}</config:config-item>'
+        f'<config:config-item config:name="VerticalSplitMode" config:type="short">{2 if row else 0}</config:config-item>'
+        f'<config:config-item config:name="HorizontalSplitPosition" config:type="int">{col}</config:config-item>'
+        f'<config:config-item config:name="VerticalSplitPosition" config:type="int">{row}</config:config-item>'
+        f'<config:config-item config:name="PositionLeft" config:type="int">0</config:config-item>'
+        f'<config:config-item config:name="PositionRight" config:type="int">{col}</config:config-item>'
+        f'<config:config-item config:name="PositionTop" config:type="int">0</config:config-item>'
+        f'<config:config-item config:name="PositionBottom" config:type="int">{row}</config:config-item>'
+        '<config:config-item config:name="ZoomType" config:type="short">0</config:config-item>'
+        '<config:config-item config:name="ZoomValue" config:type="int">100</config:config-item>'
+        '<config:config-item config:name="ActiveSplitRange" config:type="short">3</config:config-item>'
+        '</config:config-item-map-entry>'
+        '</config:config-item-map-named>'
+        '</config:config-item-map-entry>'
+        '</config:config-item-map-indexed>'
+        '</config:config-item-set>'
+    )
+
+
+def _patch_ods_shared_mode(ods_path: str, freeze: str = 'E2',
+                           sheet_name: str = 'Overall'):
+    """
+    Patch ODS zip archive to:
+      1. Set IsDocumentShared = true
+      2. Inject freeze-pane view-settings (lost during soffice conversion)
     Rebuilds the zip with mimetype stored uncompressed (ODS spec requirement).
     """
     try:
+        col, row = _freeze_cell_to_col_row(freeze)
+        freeze_xml = _build_freeze_view_xml(sheet_name, col, row)
+
         with tempfile.TemporaryDirectory() as tmp_dir:
             with zipfile.ZipFile(ods_path, 'r') as zr:
                 zr.extractall(tmp_dir)
@@ -297,15 +358,28 @@ def _patch_ods_shared_mode(ods_path: str):
             if os.path.exists(settings_path):
                 with open(settings_path, 'r', encoding='utf-8') as f:
                     content = f.read()
+
+                # 1. Patch IsDocumentShared
                 patched = re.sub(
                     r'(<config:config-item\s+config:name="IsDocumentShared"'
                     r'\s+config:type="boolean">)false(</config:config-item>)',
                     r'\1true\2',
                     content)
+
+                # 2. Inject freeze view-settings
+                #    soffice produces no ooo:view-settings block at all;
+                #    insert it just before </office:settings>
+                if freeze_xml and 'ooo:view-settings' not in patched:
+                    patched = patched.replace(
+                        '</office:settings>',
+                        freeze_xml + '</office:settings>'
+                    )
+
                 with open(settings_path, 'w', encoding='utf-8') as f:
                     f.write(patched)
             else:
-                logging.warning(f"settings.xml not found in {ods_path}, skipping shared-mode patch")
+                logging.warning(f"settings.xml not found in {ods_path}, skipping patch")
+
             os.remove(ods_path)
             tmp = Path(tmp_dir)
             with zipfile.ZipFile(ods_path, 'w') as zw:
@@ -315,20 +389,21 @@ def _patch_ods_shared_mode(ods_path: str):
                     if p.is_file() and p.name != 'mimetype':
                         zw.write(p, p.relative_to(tmp), zipfile.ZIP_DEFLATED)
     except Exception as e:
-        print(f"{COLOR_R}Error: Failed to patch ODS shared mode: {e}{NO_COLOR}")
+        print(f"{COLOR_R}Error: Failed to patch ODS: {e}{NO_COLOR}")
 
 
-def convert_to_ods_shared(xlsx_path: str) -> str:
+def convert_to_ods_shared(xlsx_path: str, freeze: str = 'E2',
+                          sheet_name: str = 'Overall') -> str:
     """
-    Convert xlsx → ods via soffice, patch shared edit mode, remove xlsx.
-    Returns the resulting .ods file path.
+    Convert xlsx → ods via soffice, patch shared edit mode + freeze panes,
+    remove xlsx.  Returns the resulting .ods file path.
     """
     cmd = ['soffice', '--headless', '--convert-to', 'ods', xlsx_path]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     os.remove(xlsx_path)
     ods_path = os.path.splitext(xlsx_path)[0] + '.ods'
-    _patch_ods_shared_mode(ods_path)
-    print(f"Output converted to ODS (shared mode enabled): {ods_path}")
+    _patch_ods_shared_mode(ods_path, freeze=freeze, sheet_name=sheet_name)
+    print(f"Output converted to ODS (shared mode + freeze enabled): {ods_path}")
     return ods_path
 
 
@@ -1158,7 +1233,7 @@ def mode_extract(config_file: str, threshold: float, output_ods: bool):
             os.remove(link)
 
     if output_ods:
-        ods_path = convert_to_ods_shared(out_xlsx)
+        ods_path = convert_to_ods_shared(out_xlsx, freeze='E2', sheet_name='Overall')
         os.symlink(ods_path, "Partition_Timing_Status_current.ods")
     else:
         print(f"Output written to: {out_xlsx}")
@@ -1255,7 +1330,7 @@ def mode_diff(file_old: str, file_new: str, output_ods: bool):
             os.remove(link)
 
     if output_ods:
-        ods_path = convert_to_ods_shared(out_xlsx)
+        ods_path = convert_to_ods_shared(out_xlsx, freeze='E2', sheet_name='Overall')
         os.symlink(ods_path, "Partition_Timing_Status_diff.ods")
     else:
         print(f"Diff output written to: {out_xlsx}")
