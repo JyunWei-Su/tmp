@@ -826,6 +826,60 @@ def get_date_from_filename(filename: str) -> str:
     return m.group(1) if m else '00000000'
 
 
+def _normalize_legacy_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Detect and rename legacy column names (Partition_Timing_Status v1 /
+    diff_partition_timing_status) to v2 CamelCase convention.
+
+    Must be called right after reading a file so downstream processing
+    sees consistent names regardless of which tool generated the file.
+
+    Old (after space-strip) → New v2
+      APRstage                           → APRStage
+      Max_transvio.(lessthanX/total)     → MaxTransVio(lt{abs(X)}/Total)
+      Max_capvio.                        → MaxCapVio
+      min_pulse_width                    → MinPulseWidth
+      min_period                         → MinPeriod
+      noise                              → Noise
+      doubleswitching                    → DoubleSwitching
+    """
+    df = _strip_col_spaces(df)   # normalise spaces first
+
+    _pat_max_trans = re.compile(
+        r'^Max_transvio\.\(lessthan(-?[\d.]+)/total\)$', re.IGNORECASE
+    )
+    _STATIC: dict = {
+        'APRstage':        COL_APR_STAGE,
+        'Max_capvio.':     COL_MAX_CAP_VIO,
+        'min_pulse_width': COL_MIN_PULSE_WIDTH,
+        'min_period':      COL_MIN_PERIOD,
+        'noise':           COL_NOISE,
+        'doubleswitching': COL_DOUBLE_SWITCHING,
+    }
+
+    rename_map: dict = {}
+    for col in df.columns:
+        if not isinstance(col, str):
+            continue
+        m = _pat_max_trans.match(col)
+        if m:
+            try:
+                val = abs(float(m.group(1)))
+                rename_map[col] = f"MaxTransVio(lt{val:g}/Total)"
+            except ValueError:
+                pass
+        elif col in _STATIC and _STATIC[col] != col:
+            rename_map[col] = _STATIC[col]
+
+    if rename_map:
+        _console.print(
+            f"  [yellow]⚑[/yellow] Legacy columns normalised: "
+            + ", ".join(f"{k} → {v}" for k, v in rename_map.items())
+        )
+        df = df.rename(columns=rename_map)
+    return df
+
+
 # ═══════════════════════════════════════════════════════════════
 # 8. Excel output utilities
 # ═══════════════════════════════════════════════════════════════
@@ -1343,6 +1397,10 @@ def mode_diff(file_old: str, file_new: str, output_ods: bool):
         _drop = [c for c in _df.columns if isinstance(c, str) and _stale_col.search(c)]
         if _drop:
             _df.drop(columns=_drop, inplace=True)
+
+    # Normalise legacy column names so old and new files can be mixed freely
+    df_old = _normalize_legacy_columns(df_old)
+    df_new = _normalize_legacy_columns(df_new)
 
     partitions = df_new[COL_PARTITION].dropna().tolist()
 
