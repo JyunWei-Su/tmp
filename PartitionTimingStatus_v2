@@ -744,7 +744,8 @@ def merge_dataframes(df_list: list, sort_list: list = [],
     """
     Outer-join a list of DataFrames on their index.
     If sort_list is given, reorder columns: for each base name in sort_list,
-    group columns as [_diff, _v{new}, _v{old}, exact] before any remainder.
+    group columns as [_diff, _v{new}, _v{old}, _v{older}..., exact] so that
+    all versioned variants of the same item stay together.
     """
     if not df_list:
         return pd.DataFrame()
@@ -755,24 +756,33 @@ def merge_dataframes(df_list: list, sort_list: list = [],
     )
     if sort_list and date_new and date_old:
         ordered, used = [], set()
-        sfx_new  = date_new[4:]
-        sfx_old  = date_old[4:]
+        sfx_new = date_new[4:]
+        sfx_old = date_old[4:]
+        _pat_ver = re.compile(r'_v(\d{4})$')
         for pat in sort_list:
-            # For each base pattern, collect columns in priority order:
-            #   1. {pat}_diff          (exact diff column)
-            #   2. {pat}_v{new}        (new versioned)
-            #   3. {pat}_v{old}        (old versioned)
-            #   4. {pat}               (exact unversioned, e.g. metadata)
-            for suffix in [f'_diff', f'_v{sfx_new}', f'_v{sfx_old}', '']:
-                if suffix == '':
-                    # exact match only — avoid re-matching versioned cols
-                    candidates = [c for c in merged.columns
-                                  if c not in used and str(c) == pat]
-                else:
-                    candidates = [c for c in merged.columns
-                                  if c not in used and str(c) == f"{pat}{suffix}"]
+            # 1. _diff column
+            # 2. _v{new} column
+            # 3. _v{old} column
+            # 4. any remaining _v{mmdd} columns for this base, sorted newest→oldest
+            # 5. exact unversioned (metadata)
+            for suffix in [f'_diff', f'_v{sfx_new}', f'_v{sfx_old}']:
+                candidates = [c for c in merged.columns
+                              if c not in used and str(c) == f"{pat}{suffix}"]
                 ordered.extend(candidates)
                 used.update(candidates)
+            # collect any other _v{mmdd} columns for this base (from older diff inputs)
+            extra_ver = [
+                c for c in merged.columns
+                if c not in used and _pat_ver.search(str(c))
+                and str(c).startswith(pat + '_v')
+            ]
+            extra_ver.sort(key=lambda c: _pat_ver.search(c).group(1), reverse=True)
+            ordered.extend(extra_ver)
+            used.update(extra_ver)
+            # exact unversioned match (metadata columns)
+            exact = [c for c in merged.columns if c not in used and str(c) == pat]
+            ordered.extend(exact)
+            used.update(exact)
         remaining = sorted([c for c in merged.columns if c not in used], reverse=True)
         merged = merged[ordered + remaining]
     return merged
