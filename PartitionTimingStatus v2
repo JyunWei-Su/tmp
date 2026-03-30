@@ -30,7 +30,7 @@ import openpyxl
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, MofNCompleteColumn
+from rich.progress import Progress, TextColumn, BarColumn, MofNCompleteColumn
 
 _console = Console()
 
@@ -962,16 +962,18 @@ def _parse_sta_directory(base_dir: str, partition_name: str,
         logging.error(f"STA directory not found: {base_dir}")
         return row
 
+    logging.info(f"Parsing partition '{partition_name}': {base_dir}")
     row[COL_FILE_ADDR] = os.path.realpath(base_dir)
     scenario_mode, design_stage, si_enable, _ = parse_pt_log(base_dir)
     row[COL_APR_STAGE] = design_stage
-    # Normalise SI_ENABLE value → display as "SI" / "nSI" / "NA"
-    if si_enable == "true":
+    # Normalise SI_ENABLE: strip whitespace, case-insensitive → "SI" / "nSI" / "NA"
+    _si = si_enable.strip().lower() if isinstance(si_enable, str) else ""
+    if _si == "true":
         row[COL_SI_NSI] = "SI"
-    elif si_enable == "false":
+    elif _si == "false":
         row[COL_SI_NSI] = "nSI"
     else:
-        row[COL_SI_NSI] = si_enable  # "NA" or unexpected raw value
+        row[COL_SI_NSI] = "NA"
 
     reports_dir = Path(base_dir) / 'reports'
     if not reports_dir.exists():
@@ -1067,6 +1069,11 @@ def _parse_sta_directory(base_dir: str, partition_name: str,
                 break
         row[COL_SI_PARAMS_ERRORS] = total_err
 
+    na_fields = [k for k, v in row.items() if v == "NA"]
+    if na_fields:
+        logging.warning(f"  [{partition_name}] NA fields: {', '.join(na_fields)}")
+    else:
+        logging.info(f"  [{partition_name}] OK — all fields parsed")
     return row
 
 
@@ -1084,27 +1091,38 @@ def mode_extract(config_file: str, threshold: float, output_ods: bool):
         1 for _, r in cfg_df.iterrows()
         if str(r.get(CFG_COL_PARTITION, "")).strip()
     )
+    # Columns to check for NA (exclude free-text / path fields)
+    _na_check_exclude = {COL_FILE_ADDR, COL_COMMENT, COL_BEOWNER}
+
     with Progress(
-        SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
         MofNCompleteColumn(),
         console=_console,
         transient=False,
     ) as progress:
-        task = progress.add_task("Parsing partitions...", total=total)
+        task = progress.add_task("Parsing", total=total)
         for _, cfg_row in cfg_df.iterrows():
             partition = str(cfg_row.get(CFG_COL_PARTITION, "")).strip()
             beowner   = str(cfg_row.get(CFG_COL_BEOWNER,   "")).strip()
             sta_dir   = str(cfg_row.get(CFG_COL_STA_DIR,   "")).strip()
             if not partition:
                 continue
-            progress.update(task, description=f"Parsing [cyan]{partition}[/cyan]")
             metrics = _parse_sta_directory(sta_dir, partition, threshold)
             metrics[COL_BEOWNER] = beowner
             rows.append(metrics)
             progress.advance(task)
-            _console.print(f"  [green]✓[/green] {partition}")
+
+            na_fields = [
+                k for k, v in metrics.items()
+                if v == "NA" and k not in _na_check_exclude
+            ]
+            if na_fields:
+                _console.print(
+                    f"  [red]✗[/red] {partition} — NA: {', '.join(na_fields)}"
+                )
+            else:
+                _console.print(f"  [green]✓[/green] {partition}")
 
     if not rows:
         print(f"{COLOR_R}Error: No valid partitions found in config.{NO_COLOR}")
@@ -1232,16 +1250,16 @@ def mode_diff(file_old: str, file_new: str, output_ods: bool):
 
     # Remove stale diff symlinks
     for ext in ('xlsx', 'ods'):
-        link = f"Partition_Timing_Status_{date_new}_Diff_current.{ext}"
+        link = f"Partition_Timing_Status_diff.{ext}"
         if os.path.exists(link) or os.path.islink(link):
             os.remove(link)
 
     if output_ods:
         ods_path = convert_to_ods_shared(out_xlsx)
-        os.symlink(ods_path, f"Partition_Timing_Status_{date_new}_Diff_current.ods")
+        os.symlink(ods_path, "Partition_Timing_Status_diff.ods")
     else:
         print(f"Diff output written to: {out_xlsx}")
-        os.symlink(out_xlsx, f"Partition_Timing_Status_{date_new}_Diff_current.xlsx")
+        os.symlink(out_xlsx, "Partition_Timing_Status_diff.xlsx")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1250,7 +1268,9 @@ def mode_diff(file_old: str, file_new: str, output_ods: bool):
 if __name__ == '__main__':
     logging.basicConfig(
         filename='partition_timing_status.log',
-        filemode='w', level=logging.INFO, format='%(message)s'
+        filemode='w', level=logging.DEBUG,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
     )
 
     parser = argparse.ArgumentParser(
