@@ -190,21 +190,53 @@ def _timing_diff_font_color(raw) -> Optional[str]:
     return None  # all zero or mixed zero/good → black
 
 
+def _count_diff_font_color(raw) -> Optional[str]:
+    """
+    Determine font color for violation-count _diff cells
+    (MaxTransVio, MaxCapVio, MinPulseWidth, MinPeriod).
+    Lower count = improved → green; higher count = worse → red.
+
+    Value may be scalar or 'a / b' slash-separated (e.g. MaxTransVio lt/total).
+    Any token > 0 → red; all tokens < 0 → green; all zero → black.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        v = float(raw)
+        if v > 0:  return "FF0000"
+        if v < 0:  return "00AA00"
+        return None
+    parts = [p.strip() for p in str(raw).split('/')]
+    try:
+        tokens = [float(p) for p in parts]
+    except ValueError:
+        return None
+    if any(t > 0 for t in tokens):  return "FF0000"
+    if all(t < 0 for t in tokens):  return "00AA00"
+    return None
+
+
 def _apply_timing_diff_colors(ws, df_out: pd.DataFrame):
     """
-    Apply red/green/black font to Setup(*) and Hold(*) _diff columns.
+    Apply red/green/black font to timing _diff columns.
+    - Setup(*) / Hold(*): WNS/TNS higher=good, NVP lower=good
+    - MaxTransVio(*) / MaxCapVio / MinPulseWidth / MinPeriod: count lower=good
     Must run after _apply_row_colors so fill is already set.
     """
+    _COUNT_PREFIXES = ('MaxTransVio(', 'MaxCapVio', 'MinPulseWidth', 'MinPeriod')
     timing_diff_cols = {
-        str(col): idx + 1
+        str(col): (idx + 1,
+                   _count_diff_font_color if str(col).startswith(_COUNT_PREFIXES)
+                   else _timing_diff_font_color)
         for idx, col in enumerate(df_out.columns)
         if isinstance(col, str) and '_diff' in col and
-           (col.startswith('Setup(') or col.startswith('Hold('))
+           (col.startswith('Setup(') or col.startswith('Hold(')
+            or col.startswith(_COUNT_PREFIXES))
     }
-    for _, col_idx in timing_diff_cols.items():
+    for _, (col_idx, color_fn) in timing_diff_cols.items():
         for row_idx in range(2, ws.max_row + 1):
             cell  = ws.cell(row=row_idx, column=col_idx)
-            color = _timing_diff_font_color(cell.value)
+            color = color_fn(cell.value)
             if color:
                 cell.font = Font(color=color)
                 cell.alignment = Alignment(
