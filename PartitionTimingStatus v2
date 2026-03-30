@@ -831,14 +831,46 @@ def _auto_col_width(ws, max_width: int = 35):
 
 
 def _apply_comment_wrap(ws):
-    """Enable wrap_text for all columns whose header starts with 'Comment'."""
-    for col in ws.iter_cols(min_row=1, max_row=ws.max_row):
+    """
+    Enable wrap_text for Comment columns and auto-adjust row height based on
+    the longest Comment value in each row (15pt per line, min 15pt).
+    openpyxl does not compute row height automatically after wrap_text is set,
+    so we estimate it here.
+    """
+    # Collect (col_index, col_width) for all Comment columns
+    comment_cols: List[tuple] = []
+    for col in ws.iter_cols(min_row=1, max_row=1):
         hdr = col[0].value
         if isinstance(hdr, str) and hdr.startswith('Comment'):
-            for cell in col[1:]:
-                cell.alignment = Alignment(
-                    horizontal='left', vertical='center', wrap_text=True
-                )
+            col_letter = col[0].column_letter
+            col_width  = ws.column_dimensions[col_letter].width or 10
+            comment_cols.append((col[0].column, col_width))
+
+    if not comment_cols:
+        return
+
+    CHAR_PER_LINE = 1.2   # approximate chars per unit of column width
+    LINE_HEIGHT   = 15.0  # points per line
+    MIN_HEIGHT    = 15.0
+
+    for row_idx in range(2, ws.max_row + 1):
+        max_lines = 1
+        for col_idx, col_width in comment_cols:
+            cell = ws.cell(row=row_idx, column=col_idx)
+            cell.alignment = Alignment(
+                horizontal='left', vertical='center', wrap_text=True
+            )
+            val = str(cell.value) if cell.value is not None else ""
+            if not val:
+                continue
+            chars_per_line = max(1, int(col_width * CHAR_PER_LINE))
+            # Count explicit newlines too
+            lines = 0
+            for segment in val.split('\n'):
+                lines += max(1, -(-len(segment) // chars_per_line))  # ceiling div
+            max_lines = max(max_lines, lines)
+
+        ws.row_dimensions[row_idx].height = max(MIN_HEIGHT, max_lines * LINE_HEIGHT)
 
 
 def _write_sheet(writer, df: pd.DataFrame, sheet_name: str,
@@ -859,9 +891,9 @@ def _write_sheet(writer, df: pd.DataFrame, sheet_name: str,
     _apply_header_style(ws)          # applied last so header always wins row 1
     apply_cell_color_rules(ws, df_out, color_rules)
     _apply_timing_diff_colors(ws, df_out)
-    _apply_comment_wrap(ws)
     _apply_hidden_columns(ws, hide_patterns)
-    _auto_col_width(ws)
+    _auto_col_width(ws)              # must run before _apply_comment_wrap (needs col widths)
+    _apply_comment_wrap(ws)          # wrap + row-height estimation uses col widths
     ws.freeze_panes = freeze
 
 
@@ -933,7 +965,13 @@ def _parse_sta_directory(base_dir: str, partition_name: str,
     row[COL_FILE_ADDR] = os.path.realpath(base_dir)
     scenario_mode, design_stage, si_enable, _ = parse_pt_log(base_dir)
     row[COL_APR_STAGE] = design_stage
-    row[COL_SI_NSI]    = si_enable
+    # Normalise SI_ENABLE value → display as "SI" / "nSI" / "NA"
+    if si_enable == "true":
+        row[COL_SI_NSI] = "SI"
+    elif si_enable == "false":
+        row[COL_SI_NSI] = "nSI"
+    else:
+        row[COL_SI_NSI] = si_enable  # "NA" or unexpected raw value
 
     reports_dir = Path(base_dir) / 'reports'
     if not reports_dir.exists():
@@ -985,7 +1023,7 @@ def _parse_sta_directory(base_dir: str, partition_name: str,
         p for p in reports_dir.glob('*report_noise_all_violate.report*')
         if p.name.endswith('.report') or p.name.endswith('.report.gz')
     )
-    if noise_files and si_enable == "true":
+    if noise_files and si_enable == "true":  # si_enable still holds raw value here
         data = _read_file(str(noise_files[-1]))
         row[COL_NOISE] = parse_si_noise(data)
 
@@ -1075,12 +1113,12 @@ def mode_extract(config_file: str, threshold: float, output_ods: bool):
     df = pd.DataFrame(rows).set_index(COL_PARTITION)
 
     # Enforce column order
-    fixed   = [COL_BEOWNER, COL_APR_STAGE, COL_SI_NSI, COL_SI_PARAMS_ERRORS]
+    fixed   = [COL_BEOWNER, COL_APR_STAGE, COL_SI_NSI, COL_COMMENT, COL_SI_PARAMS_ERRORS]
     setup   = [col_setup(c) for c in PATH_CATEGORIES]
     hold    = [col_hold(c)  for c in PATH_CATEGORIES]
     other   = [col_max_trans_vio(threshold), COL_MAX_CAP_VIO,
                COL_MIN_PULSE_WIDTH, COL_MIN_PERIOD,
-               COL_NOISE, COL_DOUBLE_SWITCHING, COL_FILE_ADDR, COL_COMMENT]
+               COL_NOISE, COL_DOUBLE_SWITCHING, COL_FILE_ADDR]
     ordered = [c for c in (fixed + setup + hold + other) if c in df.columns]
     extra   = [c for c in df.columns if c not in ordered]
     df      = df[ordered + extra]
@@ -1139,8 +1177,8 @@ def mode_diff(file_old: str, file_new: str, output_ods: bool):
         f'{COL_MIN_PULSE_WIDTH}*', f'{COL_MIN_PERIOD}*',
         f'{COL_NOISE}*', f'{COL_DOUBLE_SWITCHING}*',
     ]
-    df_old_v = select_columns(df_old_v, include=keep_patterns, exclude=['*_diff*'])
-    df_new_v = select_columns(df_new_v, include=keep_patterns, exclude=['*_diff*'])
+    df_old_v = select_columns(df_old_v, include=keep_patterns, exclude=['*_diff*', '*_diff'])
+    df_new_v = select_columns(df_new_v, include=keep_patterns, exclude=['*_diff*', '*_diff'])
 
     df_head     = lookup_partitions(df_new, partitions,
                                     cols=[COL_BEOWNER, COL_APR_STAGE, COL_SI_NSI])
