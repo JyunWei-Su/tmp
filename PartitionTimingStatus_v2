@@ -331,7 +331,7 @@ def _freeze_cell_to_col_row(freeze: str) -> tuple:
     col = 0
     for ch in col_str:
         col = col * 26 + (ord(ch) - ord('A') + 1)
-    return col, int(row_str) - 1  # 0-based
+    return col - 1, int(row_str) - 1  # 0-based
 
 
 def _build_views_xml(sheet_name: str, col: int, row: int) -> str:
@@ -369,57 +369,39 @@ def _build_views_xml(sheet_name: str, col: int, row: int) -> str:
 
 def _patch_ods_shared_mode(ods_path: str, freeze: str = 'E2',
                            sheet_name: str = 'Overall'):
-    """
-    Patch ODS zip archive to:
-      1. Set IsDocumentShared = true
-      2. Inject freeze-pane Views block inside the existing ooo:view-settings
-         (soffice conversion produces the set but omits the Views/Tables entries)
-    Rebuilds the zip with mimetype stored uncompressed (ODS spec requirement).
-    """
     try:
         col, row = _freeze_cell_to_col_row(freeze)
 
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            with zipfile.ZipFile(ods_path, 'r') as zr:
-                zr.extractall(tmp_dir)
-            settings_path = os.path.join(tmp_dir, 'settings.xml')
-            if os.path.exists(settings_path):
-                with open(settings_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-
-                # 1. Patch IsDocumentShared false → true
-                patched = re.sub(
-                    r'(<config:config-item\s+config:name="IsDocumentShared"'
-                    r'\s+config:type="boolean">)false(</config:config-item>)',
-                    r'\1true\2',
-                    content)
-
-                # 2. Inject Views block inside the ooo:view-settings config-item-set.
-                #    soffice always produces this set but never includes Views/Tables,
-                #    so freeze is lost. We insert the Views block just before the
-                #    first </config:config-item-set> that closes ooo:view-settings.
-                VIEW_SET_MARKER = 'config:name="ooo:view-settings"'
-                CLOSE_TAG       = '</config:config-item-set>'
-                if (col or row) and VIEW_SET_MARKER in patched \
-                        and 'config:name="Views"' not in patched:
-                    views_xml  = _build_views_xml(sheet_name, col, row)
-                    insert_at  = patched.index(CLOSE_TAG,
-                                               patched.index(VIEW_SET_MARKER))
-                    patched    = patched[:insert_at] + views_xml + patched[insert_at:]
-
-                with open(settings_path, 'w', encoding='utf-8') as f:
-                    f.write(patched)
-            else:
+        # ── 1. Read and patch settings.xml in memory ──────────────
+        with zipfile.ZipFile(ods_path, 'r') as zr:
+            try:
+                content = zr.read('settings.xml').decode('utf-8')
+            except KeyError:
                 logging.warning(f"settings.xml not found in {ods_path}, skipping patch")
+                return
 
-            os.remove(ods_path)
-            tmp = Path(tmp_dir)
-            with zipfile.ZipFile(ods_path, 'w') as zw:
-                if (tmp / 'mimetype').exists():
-                    zw.write(tmp / 'mimetype', 'mimetype', zipfile.ZIP_STORED)
-                for p in tmp.rglob('*'):
-                    if p.is_file() and p.name != 'mimetype':
-                        zw.write(p, p.relative_to(tmp), zipfile.ZIP_DEFLATED)
+        # Patch IsDocumentShared
+        patched = re.sub(
+            r'(<config:config-item\s+config:name="IsDocumentShared"'
+            r'\s+config:type="boolean">)false(</config:config-item>)',
+            r'\1true\2',
+            content)
+
+        # Inject Views/freeze block
+        VIEW_SET_MARKER = 'config:name="ooo:view-settings"'
+        CLOSE_TAG       = '</config:config-item-set>'
+        if (col or row) and VIEW_SET_MARKER in patched \
+                and 'config:name="Views"' not in patched:
+            views_xml = _build_views_xml(sheet_name, col, row)
+            insert_at = patched.index(CLOSE_TAG, patched.index(VIEW_SET_MARKER))
+            patched   = patched[:insert_at] + views_xml + patched[insert_at:]
+
+        # ── 2. Write patched settings.xml back using append mode ───
+        # zipfile append mode adds a new entry with the same name;
+        # the last entry wins when the file is read, so no full repack needed.
+        with zipfile.ZipFile(ods_path, 'a') as zw:
+            zw.writestr('settings.xml', patched.encode('utf-8'))
+
     except Exception as e:
         print(f"{COLOR_R}Error: Failed to patch ODS: {e}{NO_COLOR}")
 
