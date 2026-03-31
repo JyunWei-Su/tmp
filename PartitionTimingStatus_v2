@@ -413,21 +413,21 @@ def _patch_ods_freeze_panes(ods_path: str, freeze: str = 'E2',
         print(f"{COLOR_R}Error: Failed to patch ODS freeze panes: {e}{NO_COLOR}")
 
 
-def _share_ods_via_soffice(ods_path: str):
+def _share_ods_via_soffice(ods_path: str) -> bool:
     """
-    Use a soffice Basic macro with a temporary user profile to properly
-    share the document via the UNO XDocumentSharing API.
-    Just setting IsDocumentShared=true in settings.xml is insufficient —
-    LibreOffice needs setSharing() called through its API for the
-    save/merge mechanism to function correctly.
+    Use a soffice Basic macro to share the document via the UNO API.
+    Returns True if sharing was successfully applied.
     """
     abs_path = os.path.abspath(ods_path).replace('\\', '/')
+    log_path = os.path.join(tempfile.gettempdir(), '_lo_share.log')
 
     with tempfile.TemporaryDirectory() as tmp_profile:
-        # ── Basic macro: load document → setSharing(true) → store → close ──
-        basic_std = os.path.join(tmp_profile, 'user', 'basic', 'Standard')
+        basic_dir = os.path.join(tmp_profile, 'user', 'basic')
+        basic_std = os.path.join(basic_dir, 'Standard')
         os.makedirs(basic_std)
 
+        # ── Module1.xba — the actual macro ────────────────────────
+        log_path_esc = log_path.replace('\\', '/')
         with open(os.path.join(basic_std, 'Module1.xba'),
                   'w', encoding='utf-8') as f:
             f.write(
@@ -435,21 +435,48 @@ def _share_ods_via_soffice(ods_path: str):
                 '<script:module xmlns:script="http://openoffice.org/2000/script"'
                 ' script:name="Module1" script:language="StarBasic">\n'
                 'Sub ShareDoc\n'
-                '  On Error Resume Next\n'
+                f'  Dim sLog As String : sLog = "{log_path_esc}"\n'
+                '  Dim f As Integer : f = FreeFile\n'
+                '  Open sLog For Output As #f\n'
+                '  On Error GoTo ErrHandler\n'
+                '  Dim sURL As String\n'
+                f'  sURL = ConvertToURL("{abs_path}")\n'
                 '  Dim oDoc As Object\n'
                 '  oDoc = StarDesktop.loadComponentFromURL('
-                f'ConvertToURL("{abs_path}"), "_blank", 0, Array())\n'
-                '  If Not IsNull(oDoc) Then\n'
-                '    oDoc.setSharing True\n'
-                '    oDoc.store()\n'
-                '    oDoc.close True\n'
+                'sURL, "_blank", 0, Array())\n'
+                '  If IsNull(oDoc) Or IsEmpty(oDoc) Then\n'
+                '    Print #f, "ERROR: loadComponentFromURL returned null"\n'
+                '    Close #f\n'
+                '    StarDesktop.terminate()\n'
+                '    Exit Sub\n'
                 '  End If\n'
+                '  Print #f, "Document loaded"\n'
+                '  On Error GoTo TryAlt\n'
+                '  oDoc.setSharing True\n'
+                '  Print #f, "setSharing OK"\n'
+                '  GoTo DoStore\n'
+                'TryAlt:\n'
+                '  On Error GoTo ErrHandler\n'
+                '  oDoc.shareDocument ""\n'
+                '  Print #f, "shareDocument OK"\n'
+                'DoStore:\n'
+                '  oDoc.store()\n'
+                '  Print #f, "store OK"\n'
+                '  oDoc.close True\n'
+                '  Print #f, "SUCCESS"\n'
+                '  Close #f\n'
+                '  StarDesktop.terminate()\n'
+                '  Exit Sub\n'
+                'ErrHandler:\n'
+                '  Print #f, "ERROR " & Err & ": " & Error$\n'
+                '  Close #f\n'
                 '  StarDesktop.terminate()\n'
                 'End Sub\n'
                 '</script:module>\n'
             )
 
-        with open(os.path.join(basic_std, 'script-lb.xml'),
+        # ── script.xlb — library descriptor (NOT script-lb.xml) ───
+        with open(os.path.join(basic_std, 'script.xlb'),
                   'w', encoding='utf-8') as f:
             f.write(
                 '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -460,19 +487,29 @@ def _share_ods_via_soffice(ods_path: str):
                 '</library:library>\n'
             )
 
-        with open(os.path.join(tmp_profile, 'user', 'basic', 'script-lc.xml'),
+        # ── script.xlc — library container (NOT script-lc.xml) ────
+        with open(os.path.join(basic_dir, 'script.xlc'),
                   'w', encoding='utf-8') as f:
             f.write(
                 '<?xml version="1.0" encoding="UTF-8"?>\n'
                 '<library:libraries xmlns:library="http://openoffice.org/2000/library"'
                 ' xmlns:xlink="http://www.w3.org/1999/xlink">\n'
                 ' <library:library library:name="Standard"'
-                ' xlink:href="Standard/script-lb.xml"'
+                ' xlink:href="Standard/script.xlb"'
                 ' xlink:type="simple" library:link="false"/>\n'
                 '</library:libraries>\n'
             )
 
-        # Macro security → Low (allow headless macro execution)
+        # ── dialog.xlc — empty dialog library container ───────────
+        with open(os.path.join(basic_dir, 'dialog.xlc'),
+                  'w', encoding='utf-8') as f:
+            f.write(
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<library:libraries xmlns:library="http://openoffice.org/2000/library"'
+                ' xmlns:xlink="http://www.w3.org/1999/xlink"/>\n'
+            )
+
+        # ── registrymodifications.xcu — macro security → Low ──────
         with open(os.path.join(tmp_profile, 'user', 'registrymodifications.xcu'),
                   'w', encoding='utf-8') as f:
             f.write(
@@ -487,6 +524,11 @@ def _share_ods_via_soffice(ods_path: str):
             )
 
         profile_url = 'file:///' + tmp_profile.replace('\\', '/')
+
+        # Remove stale log
+        if os.path.exists(log_path):
+            os.remove(log_path)
+
         try:
             subprocess.run([
                 'soffice', '--headless', '--invisible', '--norestore',
@@ -498,6 +540,27 @@ def _share_ods_via_soffice(ods_path: str):
             logging.warning("soffice macro timed out while sharing %s", ods_path)
         except Exception as e:
             print(f"{COLOR_R}Error: Failed to share ODS via soffice: {e}{NO_COLOR}")
+
+    # ── Check result from macro log ───────────────────────────────
+    success = False
+    if os.path.exists(log_path):
+        try:
+            with open(log_path, 'r', encoding='utf-8') as f:
+                log = f.read().strip()
+            if 'SUCCESS' in log:
+                success = True
+            else:
+                logging.warning("soffice share macro log: %s", log)
+        except Exception:
+            pass
+        try:
+            os.remove(log_path)
+        except Exception:
+            pass
+    else:
+        logging.warning("soffice share macro produced no log — macro likely did not execute")
+
+    return success
 
 
 def convert_to_ods_shared(xlsx_path: str, freeze: str = 'E2',
@@ -512,7 +575,7 @@ def convert_to_ods_shared(xlsx_path: str, freeze: str = 'E2',
     ods_path = os.path.splitext(xlsx_path)[0] + '.ods'
     _share_ods_via_soffice(ods_path)
     _patch_ods_freeze_panes(ods_path, freeze=freeze, sheet_name=sheet_name)
-    print(f"Output converted to ODS (shared mode + freeze enabled): {ods_path}")
+    print(f"Output converted to ODS (shared mode + freeze): {ods_path}")
     return ods_path
 
 
