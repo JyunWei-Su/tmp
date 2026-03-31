@@ -340,7 +340,7 @@ def _build_views_xml(sheet_name: str, col: int, row: int) -> str:
     that encodes freeze panes. This is injected *inside* the existing
     ooo:view-settings config-item-set in settings.xml.
 
-    col, row are 0-based (e.g. E2 → col=5, row=1).
+    col, row are 0-based (e.g. E2 → col=4, row=1).
     HorizontalSplitMode / VerticalSplitMode = 2 means freeze.
     """
     return (
@@ -367,74 +367,151 @@ def _build_views_xml(sheet_name: str, col: int, row: int) -> str:
     )
 
 
-def _patch_ods_shared_mode(ods_path: str, freeze: str = 'E2',
-                           sheet_name: str = 'Overall'):
+def _patch_ods_freeze_panes(ods_path: str, freeze: str = 'E2',
+                             sheet_name: str = 'Overall'):
+    """Inject freeze-pane Views block into settings.xml of an ODS file."""
     try:
         col, row = _freeze_cell_to_col_row(freeze)
-
-        # ── 1. Read all entries and patch in memory ────────────────
-        with zipfile.ZipFile(ods_path, 'r') as zr:
-            names = zr.namelist()
-            entries = {name: zr.read(name) for name in names}
-
-        if 'settings.xml' not in entries:
-            logging.warning(f"settings.xml not found in {ods_path}, skipping patch")
+        if not (col or row):
             return
 
-        # Patch settings.xml: IsDocumentShared false → true + inject Views/freeze
-        settings = entries['settings.xml'].decode('utf-8')
-        settings = re.sub(
-            r'(<config:config-item\s+config:name="IsDocumentShared"'
-            r'\s+config:type="boolean">)false(</config:config-item>)',
-            r'\1true\2',
-            settings)
+        with zipfile.ZipFile(ods_path, 'r') as zr:
+            info_list = zr.infolist()
+            data = {info.filename: zr.read(info.filename) for info in info_list}
+
+        if 'settings.xml' not in data:
+            return
+
+        settings = data['settings.xml'].decode('utf-8')
         VIEW_SET_MARKER = 'config:name="ooo:view-settings"'
         CLOSE_TAG       = '</config:config-item-set>'
-        if (col or row) and VIEW_SET_MARKER in settings \
-                and 'config:name="Views"' not in settings:
-            views_xml = _build_views_xml(sheet_name, col, row)
-            insert_at = settings.index(CLOSE_TAG, settings.index(VIEW_SET_MARKER))
-            settings  = settings[:insert_at] + views_xml + settings[insert_at:]
-        entries['settings.xml'] = settings.encode('utf-8')
+        if VIEW_SET_MARKER not in settings or 'config:name="Views"' in settings:
+            return  # already has Views or no view-settings block
+        views_xml = _build_views_xml(sheet_name, col, row)
+        insert_at = settings.index(CLOSE_TAG, settings.index(VIEW_SET_MARKER))
+        settings  = settings[:insert_at] + views_xml + settings[insert_at:]
+        data['settings.xml'] = settings.encode('utf-8')
 
-        # Patch content.xml: add table:use-change-tracking="true" to <table:spreadsheet>
-        # LibreOffice requires this attribute alongside IsDocumentShared for saves to work.
-        if 'content.xml' in entries:
-            content_xml = entries['content.xml'].decode('utf-8')
-            content_xml = re.sub(
-                r'(<table:spreadsheet\b)(?![^>]*table:use-change-tracking)',
-                r'\1 table:use-change-tracking="true"',
-                content_xml)
-            entries['content.xml'] = content_xml.encode('utf-8')
-
-        # ── 2. Repack zip cleanly (no duplicate entries) ───────────
+        # Repack preserving original ZipInfo metadata
         tmp_path = ods_path + '.tmp'
+        seen = set()
         with zipfile.ZipFile(tmp_path, 'w') as zw:
             # mimetype must be first and uncompressed per ODS spec
-            if 'mimetype' in entries:
-                zw.writestr(zipfile.ZipInfo('mimetype'), entries['mimetype'],
-                            zipfile.ZIP_STORED)
-            for name in names:
-                if name == 'mimetype':
+            if 'mimetype' in data:
+                mi = zipfile.ZipInfo('mimetype')
+                mi.compress_type = zipfile.ZIP_STORED
+                zw.writestr(mi, data['mimetype'])
+                seen.add('mimetype')
+            for info in info_list:
+                if info.filename in seen:
                     continue
-                zw.writestr(name, entries[name], zipfile.ZIP_DEFLATED)
+                seen.add(info.filename)
+                zw.writestr(info, data[info.filename])
         os.replace(tmp_path, ods_path)
 
     except Exception as e:
-        print(f"{COLOR_R}Error: Failed to patch ODS: {e}{NO_COLOR}")
+        print(f"{COLOR_R}Error: Failed to patch ODS freeze panes: {e}{NO_COLOR}")
+
+
+def _share_ods_via_soffice(ods_path: str):
+    """
+    Use a soffice Basic macro with a temporary user profile to properly
+    share the document via the UNO XDocumentSharing API.
+    Just setting IsDocumentShared=true in settings.xml is insufficient —
+    LibreOffice needs setSharing() called through its API for the
+    save/merge mechanism to function correctly.
+    """
+    abs_path = os.path.abspath(ods_path).replace('\\', '/')
+
+    with tempfile.TemporaryDirectory() as tmp_profile:
+        # ── Basic macro: load document → setSharing(true) → store → close ──
+        basic_std = os.path.join(tmp_profile, 'user', 'basic', 'Standard')
+        os.makedirs(basic_std)
+
+        with open(os.path.join(basic_std, 'Module1.xba'),
+                  'w', encoding='utf-8') as f:
+            f.write(
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<script:module xmlns:script="http://openoffice.org/2000/script"'
+                ' script:name="Module1" script:language="StarBasic">\n'
+                'Sub ShareDoc\n'
+                '  On Error Resume Next\n'
+                '  Dim oDoc As Object\n'
+                '  oDoc = StarDesktop.loadComponentFromURL('
+                f'ConvertToURL("{abs_path}"), "_blank", 0, Array())\n'
+                '  If Not IsNull(oDoc) Then\n'
+                '    oDoc.setSharing True\n'
+                '    oDoc.store()\n'
+                '    oDoc.close True\n'
+                '  End If\n'
+                '  StarDesktop.terminate()\n'
+                'End Sub\n'
+                '</script:module>\n'
+            )
+
+        with open(os.path.join(basic_std, 'script-lb.xml'),
+                  'w', encoding='utf-8') as f:
+            f.write(
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<library:library xmlns:library="http://openoffice.org/2000/library"'
+                ' library:name="Standard" library:readonly="false"'
+                ' library:passwordprotected="false">\n'
+                ' <library:element library:name="Module1"/>\n'
+                '</library:library>\n'
+            )
+
+        with open(os.path.join(tmp_profile, 'user', 'basic', 'script-lc.xml'),
+                  'w', encoding='utf-8') as f:
+            f.write(
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<library:libraries xmlns:library="http://openoffice.org/2000/library"'
+                ' xmlns:xlink="http://www.w3.org/1999/xlink">\n'
+                ' <library:library library:name="Standard"'
+                ' xlink:href="Standard/script-lb.xml"'
+                ' xlink:type="simple" library:link="false"/>\n'
+                '</library:libraries>\n'
+            )
+
+        # Macro security → Low (allow headless macro execution)
+        with open(os.path.join(tmp_profile, 'user', 'registrymodifications.xcu'),
+                  'w', encoding='utf-8') as f:
+            f.write(
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<oor:items xmlns:oor="http://openoffice.org/2001/registry"'
+                ' xmlns:xs="http://www.w3.org/2001/XMLSchema"'
+                ' xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">\n'
+                '<item oor:path="/org.openoffice.Office.Common/Security/Scripting">'
+                '<prop oor:name="MacroSecurityLevel" oor:op="fuse">'
+                '<value>0</value></prop></item>\n'
+                '</oor:items>\n'
+            )
+
+        profile_url = 'file:///' + tmp_profile.replace('\\', '/')
+        try:
+            subprocess.run([
+                'soffice', '--headless', '--invisible', '--norestore',
+                '--nofirststartwizard',
+                f'-env:UserInstallation={profile_url}',
+                'macro:///Standard.Module1.ShareDoc'
+            ], timeout=60, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            logging.warning("soffice macro timed out while sharing %s", ods_path)
+        except Exception as e:
+            print(f"{COLOR_R}Error: Failed to share ODS via soffice: {e}{NO_COLOR}")
 
 
 def convert_to_ods_shared(xlsx_path: str, freeze: str = 'E2',
                           sheet_name: str = 'Overall') -> str:
     """
-    Convert xlsx → ods via soffice, patch shared edit mode + freeze panes,
+    Convert xlsx → ods via soffice, enable shared edit mode + freeze panes,
     remove xlsx.  Returns the resulting .ods file path.
     """
     cmd = ['soffice', '--headless', '--convert-to', 'ods', xlsx_path]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     os.remove(xlsx_path)
     ods_path = os.path.splitext(xlsx_path)[0] + '.ods'
-    _patch_ods_shared_mode(ods_path, freeze=freeze, sheet_name=sheet_name)
+    _share_ods_via_soffice(ods_path)
+    _patch_ods_freeze_panes(ods_path, freeze=freeze, sheet_name=sheet_name)
     print(f"Output converted to ODS (shared mode + freeze enabled): {ods_path}")
     return ods_path
 
