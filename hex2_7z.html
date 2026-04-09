@@ -307,6 +307,105 @@
   }
   .btn-clear:hover { border-color:var(--red); color:var(--red); }
 
+  .btn-fix {
+    background: transparent;
+    color: var(--amber);
+    border: 1px solid rgba(240,165,0,0.3);
+  }
+  .btn-fix:hover { border-color:var(--amber); box-shadow:0 0 16px rgba(240,165,0,0.15); }
+
+  /* ── OCR diff modal ── */
+  .modal-backdrop {
+    display: none;
+    position: fixed; inset: 0; z-index: 200;
+    background: rgba(0,0,0,0.75);
+    backdrop-filter: blur(3px);
+    align-items: center;
+    justify-content: center;
+  }
+  .modal-backdrop.show { display: flex; }
+
+  .modal {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-top: 2px solid var(--amber);
+    border-radius: 4px;
+    width: min(820px, 94vw);
+    max-height: 82vh;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 24px 60px rgba(0,0,0,0.6);
+    animation: modalIn .18s ease both;
+  }
+  @keyframes modalIn { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:none} }
+
+  .modal-head {
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+  }
+  .modal-title {
+    font-family: 'Barlow Condensed', sans-serif;
+    font-weight: 700;
+    font-size: 14px;
+    letter-spacing: 3px;
+    color: var(--amber);
+    text-transform: uppercase;
+  }
+  .modal-meta { font-size: 10px; color: var(--dim); letter-spacing: 1px; }
+  .modal-close {
+    background: none; border: none;
+    color: var(--dim); cursor: pointer;
+    font-size: 18px; line-height: 1; padding: 0 4px;
+    transition: color .15s;
+  }
+  .modal-close:hover { color: var(--red); }
+
+  .modal-body {
+    overflow-y: auto; flex: 1;
+    padding: 14px 20px;
+  }
+
+  .diff-table {
+    width: 100%; border-collapse: collapse;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+  }
+  .diff-table th {
+    font-family: 'Barlow Condensed', sans-serif;
+    font-size: 10px; letter-spacing: 2px;
+    color: var(--dim); text-transform: uppercase;
+    padding: 4px 10px; text-align: left;
+    border-bottom: 1px solid var(--border);
+    position: sticky; top: 0;
+    background: var(--surface);
+  }
+  .diff-table td {
+    padding: 3px 10px; vertical-align: top;
+    border-bottom: 1px solid rgba(255,255,255,0.03);
+    word-break: break-all;
+  }
+  .diff-table tr:hover td { background: rgba(255,255,255,0.02); }
+  .td-line { color: var(--dim); width: 46px; text-align: right; padding-right: 14px; user-select:none; }
+  .td-orig { color: #8aaa88; }
+  .td-fix  { color: var(--text); }
+  .ch-orig { background: rgba(240,90,58,0.28); color: var(--red); border-radius: 2px; padding: 0 1px; }
+  .ch-fix  { background: rgba(240,165,0,0.25); color: var(--amber); border-radius: 2px; padding: 0 1px; }
+  .no-changes { padding: 28px; text-align: center; color: var(--accent); font-size: 13px; letter-spacing: 1px; }
+
+  .modal-foot {
+    padding: 12px 20px;
+    border-top: 1px solid var(--border);
+    display: flex; align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0; gap: 10px;
+  }
+  .modal-foot-info { font-size: 10px; color: var(--dim); letter-spacing: 1px; }
+  .modal-foot-btns { display: flex; gap: 8px; }
+
   /* ── Status ── */
   .status {
     margin-top: 18px;
@@ -435,10 +534,30 @@
     <div class="btn-row">
       <button class="btn btn-go"      onclick="doConvert()">&#9654; RESTORE &amp; DOWNLOAD</button>
       <button class="btn btn-preview" onclick="doPreview()">&#9672; PREVIEW HEADER</button>
+      <button class="btn btn-fix"     onclick="doOcrFix()">&#9883; OCR FIX</button>
       <button class="btn btn-clear"   onclick="doClear()">&#10005; CLEAR</button>
     </div>
     <div class="status" id="statusEl"></div>
     <div class="preview" id="previewEl"></div>
+  </div>
+
+  <!-- OCR diff modal -->
+  <div class="modal-backdrop" id="ocrModal">
+    <div class="modal">
+      <div class="modal-head">
+        <span class="modal-title">&#9883; OCR Auto-Fix</span>
+        <span class="modal-meta" id="ocrMeta"></span>
+        <button class="modal-close" onclick="closeModal()">&#10005;</button>
+      </div>
+      <div class="modal-body" id="ocrBody"></div>
+      <div class="modal-foot">
+        <span class="modal-foot-info" id="ocrFootInfo"></span>
+        <div class="modal-foot-btns">
+          <button class="btn btn-fix"   id="ocrApplyBtn" onclick="applyFix()">&#10003; APPLY FIX</button>
+          <button class="btn btn-clear" onclick="closeModal()">CANCEL</button>
+        </div>
+      </div>
+    </div>
   </div>
 
   <!-- note -->
@@ -674,6 +793,110 @@ function doPreview() {
     setStatus('&#10007; '+esc(e.message.replace(/\n/g,'<br>&nbsp;&nbsp;')),'err');
   }
 }
+
+// ── OCR fix ──────────────────────────────────────────────────────────
+// Replacement map: only applied to hex content chars (non-blank lines, after leading space)
+const OCR_MAP = {
+  'I':'1', 'l':'1', '|':'1',
+  'O':'0', 'o':'0',
+  'S':'5', 's':'5',
+  'Z':'2', 'z':'2',
+  'B':'8',
+  'G':'6',
+  'g':'9',
+};
+const OCR_RE = new RegExp('[' + Object.keys(OCR_MAP).map(c => c.replace(/[|\\]/g,'\\$&')).join('') + ']', 'g');
+
+let _pendingFixed = null;  // stores the fixed textarea value pending apply
+
+function doOcrFix() {
+  const raw = $('hexIn').value;
+  if (!raw.trim()) { setStatus('&#9888; 請先貼入 hexdump 內容', 'err'); return; }
+
+  const lines = raw.split('\n');
+  const diffs = [];   // { lineIdx, origContent, fixedContent }
+  let totalChanged = 0;
+
+  const fixedLines = lines.map((line, idx) => {
+    // Blank line → keep as-is
+    if (line.trim() === '') return line;
+    // Data line: has 1 leading space. Strip it, fix, re-add.
+    const hasLeadingSpace = line.startsWith(' ');
+    const content = hasLeadingSpace ? line.slice(1) : line;
+    const fixed = content.replace(OCR_RE, m => OCR_MAP[m]);
+    if (fixed !== content) {
+      diffs.push({ lineIdx: idx + 1, orig: content, fixed });
+      totalChanged += [...content].filter((c, i) => fixed[i] !== c).length;
+    }
+    return hasLeadingSpace ? ' ' + fixed : fixed;
+  });
+
+  _pendingFixed = fixedLines.join('\n');
+
+  // Build modal content
+  const applyBtn = $('ocrApplyBtn');
+  if (diffs.length === 0) {
+    $('ocrBody').innerHTML = '<div class="no-changes">&#10003; 未偵測到 OCR 錯誤字元，內容已是乾淨的 hex</div>';
+    $('ocrMeta').textContent = '';
+    $('ocrFootInfo').textContent = '0 行需要修正';
+    applyBtn.disabled = true;
+  } else {
+    applyBtn.disabled = false;
+    $('ocrMeta').textContent = diffs.length + ' lines · ' + totalChanged + ' chars';
+    $('ocrFootInfo').textContent = '套用後將直接修改 textarea 內容';
+
+    // Build diff table
+    let html = '<table class="diff-table"><thead><tr>'
+      + '<th>LINE</th><th>ORIGINAL</th><th>FIXED</th>'
+      + '</tr></thead><tbody>';
+
+    for (const d of diffs) {
+      // Build highlighted original
+      let origHl = '';
+      let fixHl  = '';
+      for (let i = 0; i < Math.max(d.orig.length, d.fixed.length); i++) {
+        const co = d.orig[i]  || '';
+        const cf = d.fixed[i] || '';
+        if (co !== cf) {
+          origHl += '<span class="ch-orig">' + esc(co) + '</span>';
+          fixHl  += '<span class="ch-fix">'  + esc(cf) + '</span>';
+        } else {
+          origHl += esc(co);
+          fixHl  += esc(cf);
+        }
+      }
+      html += '<tr>'
+        + '<td class="td-line">' + d.lineIdx + '</td>'
+        + '<td class="td-orig">' + origHl + '</td>'
+        + '<td class="td-fix">'  + fixHl  + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>';
+    $('ocrBody').innerHTML = html;
+  }
+
+  $('ocrModal').className = 'modal-backdrop show';
+}
+
+function applyFix() {
+  if (_pendingFixed === null) return;
+  $('hexIn').value = _pendingFixed;
+  _pendingFixed = null;
+  closeModal();
+  onHexInput();
+  setStatus('&#9883; OCR 修正已套用', 'ok');
+}
+
+function closeModal() {
+  $('ocrModal').className = 'modal-backdrop';
+}
+
+// Close modal on backdrop click
+document.addEventListener('DOMContentLoaded', () => {
+  $('ocrModal').addEventListener('click', e => {
+    if (e.target === $('ocrModal')) closeModal();
+  });
+});
 
 function doClear() {
   $('hexIn').value = '';
